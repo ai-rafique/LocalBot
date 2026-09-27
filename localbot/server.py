@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import experiments, feedback, generation, index, models, storage
+from . import experiments, feedback, generation, index, models, storage, vision
 from .config import GROUPS, HOST, PORT, PRESETS, SCHEMA, S, SUPPORTED_TYPES, WEB_DIR
 
 app = FastAPI(title="LocalBot", docs_url=None, redoc_url=None, openapi_url=None)
@@ -260,6 +260,14 @@ def upload(files: list[UploadFile] = File(...)):
             except Exception as e:
                 errors.append(generation.friendly_error(e) if "ollama" in type(e).__module__ else str(e))
     return {"added": reports, "errors": errors, "index": index.state()}
+
+
+@app.get("/api/images/{image_id}")
+def image(image_id: str):
+    path = vision.path_of(image_id)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(404, "Picture not found")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "max-age=86400"})
 
 
 @app.delete("/api/documents/{name}")

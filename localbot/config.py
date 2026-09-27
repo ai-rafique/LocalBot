@@ -22,11 +22,12 @@ CHROMA_DIR = os.path.join(DATA_DIR, "chroma")
 DB_PATH = os.path.join(DATA_DIR, "localbot.db")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 INDEX_STATE_PATH = os.path.join(DATA_DIR, "index_state.json")
+IMAGES_DIR = os.path.join(DATA_DIR, "images")  # pictures from documents + their transcripts
 WEB_DIR = os.path.join(BASE_DIR, "web")
 
-HOST, PORT = "127.0.0.1", int(os.environ.get("LOCALBOT_PORT", 7860))
+HOST, PORT = "127.0.0.1", int(os.environ.get("LOCALBOT_PORT", 64000))
 
-SUPPORTED_TYPES = [".pdf", ".docx", ".txt", ".md"]
+SUPPORTED_TYPES = [".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp"]
 EMBED_BATCH = 32        # chunks per Ollama embed call
 RRF_K = 60              # standard reciprocal-rank-fusion constant
 CHARS_PER_TOKEN = 3.0   # conservative estimate used to keep prompts inside the context window
@@ -67,6 +68,12 @@ SCHEMA = [
     _s("embed_model", "models", "Embedding model", "model", "nomic-embed-text",
        "Turns passages and questions into vectors for meaning-based search.",
        "Changing it requires re-indexing every document.", role="embedding", reindex=True),
+    _s("vision_model", "models", "Picture reader", "model", "qwen3.5:2b",
+       "Reads the text in pictures when documents are added or re-indexed. Must accept images "
+       "(qwen3.5 does). Separate from the chat model, so trying a text-only chat model doesn't "
+       "lose your picture passages.",
+       "Only used while adding documents. Changing it means pictures are read again at the next re-index.",
+       role="chat", reindex=True),
     _s("rerank_model", "models", "Reranking model", "model", "",
        "Scores which passages answer the question. Empty = use the chat model, which is already in memory.",
        "A separate model needs its own VRAM; on a 4 GB GPU, keep it empty.", role="chat", advanced=True),
@@ -146,6 +153,12 @@ SCHEMA = [
        "How long Ollama keeps models in memory after the last request.",
        "Longer avoids a slow first answer after a pause.", choices=["5m", "30m", "2h", "-1"], advanced=True),
     # --- Chunking
+    _s("read_images", "chunking", "Read pictures", "bool", True,
+       "Pictures in PDF, Word and PowerPoint files, and image files, are transcribed by the chat "
+       "model when a document is added, so their text becomes searchable.",
+       "Adds a second or two per picture when adding documents (remembered afterwards). "
+       "Text in screenshots reads well; diagrams and photos only get a short description.",
+       reindex=True),
     _s("chunk_size", "chunking", "Chunk size", "int", 800,
        "Target size of a passage. Paragraphs are packed up to this; a new section starts a new chunk.",
        "Smaller: more precise matches, less context each. Larger: more context, blurrier matches.",

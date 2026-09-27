@@ -19,7 +19,7 @@ import chromadb
 import ollama
 from chromadb.config import Settings as ChromaSettings
 
-from . import documents
+from . import documents, vision
 from .config import CHROMA_DIR, DOCS_DIR, EMBED_BATCH, INDEX_STATE_PATH, SUPPORTED_TYPES, S, embed_prefixes
 
 # anonymized_telemetry=False stops Chroma from sending usage data to PostHog.
@@ -119,13 +119,53 @@ def keyword_search(query, n, k1=1.5, b=0.75):
 
 
 # --- Library -----------------------------------------------------------------
-def _chunk_file(path, chunk_size, overlap):
-    return documents.chunk_paragraphs(documents.load_paragraphs(path), int(chunk_size), int(overlap))
+def _read_pictures(paras, transcribe=True):
+    """Replace picture placeholders with their transcripts, marked as such
+    so the model (and you) know the text was read from a picture.
+    transcribe=False (previews) uses remembered transcripts only.
+    Returns (paragraphs, pictures read, pictures skipped, pictures unreadable)."""
+    out, read, skipped, failed = [], 0, 0, 0
+    readable = S.read_images and (not transcribe or vision.can_read())
+    for p in paras:
+        if "image" not in p:
+            out.append(p)
+            continue
+        image_id = vision.store(p["image"]) if S.read_images else None
+        if not image_id:
+            continue
+        if not readable:
+            skipped += 1
+            continue
+        if transcribe:
+            try:
+                text = vision.transcribe(image_id)
+            except Exception as e:
+                # One unreadable picture must not fail the whole document.
+                if "connect" in str(e).lower():
+                    raise
+                failed += 1
+                continue
+        else:
+            text = vision.cached(image_id) or "(picture: read when added)"
+        if len(text.strip()) < 15:
+            failed += not text.strip()
+            continue  # nothing legible or describable
+        where = f", p. {p['page']}" if p.get("page") else ""
+        out.append({"text": f"[Picture{where}]\n{text}", "page": p["page"], "level": 0, "image_id": image_id})
+        read += 1
+    return out, read, skipped, failed
+
+
+def _chunk_file(path, chunk_size, overlap, transcribe=True):
+    paras, read, skipped, failed = _read_pictures(documents.load_paragraphs(path), transcribe)
+    chunks = documents.chunk_paragraphs(paras, int(chunk_size), int(overlap))
+    return chunks, {"pictures": read, "pictures_skipped": skipped, "pictures_unreadable": failed}
 
 
 def _add_chunks(col, fname, chunks, chunk_size, overlap):
     metas = [{"source": fname, "chunk": i, "chars": len(c["text"]), "section": c["section"],
               "page_start": c["page_start"], "page_end": c["page_end"],
+              "images": ",".join(c.get("images", [])),
               "chunk_size": chunk_size, "overlap": overlap} for i, c in enumerate(chunks)]
     vectors = embed([documents.chunk_header(m) + "\n" + c["text"] for m, c in zip(metas, chunks)])
     col.delete(where={"source": fname})  # re-adding a file replaces it
@@ -141,9 +181,9 @@ def ingest(path, name=None):
     if ext not in SUPPORTED_TYPES:
         raise ValueError(f"{name}: unsupported type (use {', '.join(SUPPORTED_TYPES)})")
     t0 = time.perf_counter()
-    chunks = _chunk_file(path, S.chunk_size, S.chunk_overlap)
+    chunks, info = _chunk_file(path, S.chunk_size, S.chunk_overlap)
     if not chunks:
-        raise ValueError(f"{name}: no extractable text (a scanned PDF needs OCR first)")
+        raise ValueError(f"{name}: no extractable text or legible pictures")
     t1 = time.perf_counter()
     _add_chunks(_collection, name, chunks, S.chunk_size, S.chunk_overlap)
     invalidate_keyword_index(_collection)
@@ -153,7 +193,7 @@ def ingest(path, name=None):
         shutil.copy2(path, stored)
     _save_state()
     return {"document": name, "chunks": len(chunks), "embed_s": round(time.perf_counter() - t1, 2),
-            "chunk_s": round(t1 - t0, 3)}
+            "read_s": round(t1 - t0, 2), **info}
 
 
 def reindex(progress=None):
@@ -172,8 +212,16 @@ def reindex(progress=None):
     for name in set(library_counts()) - set(files):
         _collection.delete(where={"source": name})
     invalidate_keyword_index(_collection)
+    _forget_unused_pictures()
     _save_state()
     return reports, errors
+
+
+def _forget_unused_pictures():
+    ids = set()
+    for m in _collection.get(include=["metadatas"])["metadatas"] or []:
+        ids.update(i for i in (m.get("images") or "").split(",") if i)
+    vision.remove_unused(ids)
 
 
 def remove(name):
@@ -182,6 +230,7 @@ def remove(name):
     stored = os.path.join(DOCS_DIR, name)
     if os.path.isfile(stored):
         os.remove(stored)
+    _forget_unused_pictures()
 
 
 def stored_documents():
@@ -195,7 +244,8 @@ def library_counts():
     data = _collection.get(include=["metadatas"])
     out = {}
     for m in data["metadatas"] or []:
-        d = out.setdefault(m["source"], {"chunks": 0, "chars": 0, "sections": set(), "pages": 0})
+        d = out.setdefault(m["source"], {"chunks": 0, "chars": 0, "sections": set(), "pages": 0, "pictures": set()})
+        d["pictures"].update(i for i in (m.get("images") or "").split(",") if i)
         d["chunks"] += 1
         d["chars"] += m.get("chars", 0)
         if m.get("section"):
@@ -203,6 +253,7 @@ def library_counts():
         d["pages"] = max(d["pages"], m.get("page_end") or 0)
     for d in out.values():
         d["sections"] = len(d["sections"])
+        d["pictures"] = len(d["pictures"])
     return out
 
 
@@ -211,7 +262,7 @@ def library():
     rows = []
     for name in sorted(set(counts) | set(stored_documents())):
         path = os.path.join(DOCS_DIR, name)
-        c = counts.get(name, {"chunks": 0, "chars": 0, "sections": 0, "pages": 0})
+        c = counts.get(name, {"chunks": 0, "chars": 0, "sections": 0, "pages": 0, "pictures": 0})
         rows.append({
             "name": name, "type": os.path.splitext(name)[1].lstrip(".").lower(),
             "size_bytes": os.path.getsize(path) if os.path.isfile(path) else None,
@@ -225,7 +276,8 @@ def chunks_of(name, limit=500):
     data = _collection.get(where={"source": name}, include=["documents", "metadatas"])
     items = sorted(zip(data["documents"], data["metadatas"]), key=lambda x: x[1].get("chunk", 0))
     return [{"chunk": m.get("chunk"), "section": m.get("section", ""), "pages": documents.page_range(m),
-             "chars": len(t), "text": t} for t, m in items[:limit]]
+             "chars": len(t), "text": t, "images": [i for i in (m.get("images") or "").split(",") if i]}
+            for t, m in items[:limit]]
 
 
 def preview(chunk_size, overlap, name=None, samples=40):
@@ -234,12 +286,14 @@ def preview(chunk_size, overlap, name=None, samples=40):
     names = [name] if name else stored_documents()
     sizes, per_doc, sample = [], {}, []
     for n in names:
-        chunks = _chunk_file(os.path.join(DOCS_DIR, n), chunk_size, overlap)
+        # Pictures aren't read for a preview; remembered transcripts are used.
+        chunks, _ = _chunk_file(os.path.join(DOCS_DIR, n), chunk_size, overlap, transcribe=False)
         per_doc[n] = len(chunks)
         sizes += [len(c["text"]) for c in chunks]
         if name:
             sample = [{"chunk": i, "section": c["section"], "pages": documents.page_range(c),
-                       "chars": len(c["text"]), "text": c["text"]} for i, c in enumerate(chunks[:samples])]
+                       "chars": len(c["text"]), "text": c["text"], "images": c.get("images", [])}
+                      for i, c in enumerate(chunks[:samples])]
     bins = [0] * 10
     for s in sizes:
         bins[min(9, int(10 * s / (chunk_size + 1)))] += 1
@@ -285,7 +339,7 @@ class use_temporary:
             _ephemeral = chromadb.EphemeralClient(settings=ChromaSettings(anonymized_telemetry=False))
         self.col = _open(f"tmp-{uuid.uuid4().hex[:10]}", _ephemeral)
         for name in stored_documents():
-            chunks = _chunk_file(os.path.join(DOCS_DIR, name), self.chunk_size, self.overlap)
+            chunks, _ = _chunk_file(os.path.join(DOCS_DIR, name), self.chunk_size, self.overlap)
             if chunks:
                 _add_chunks(self.col, name, chunks, self.chunk_size, self.overlap)
         _local.collection = self.col

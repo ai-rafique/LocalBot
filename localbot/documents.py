@@ -113,12 +113,19 @@ def _markdown_paragraphs(text):
     return paras
 
 
+def _image(data, page=0):
+    """A picture waiting to be read. index.ingest turns it into text by
+    transcription; everything here stays free of model calls."""
+    return {"text": "", "page": page, "level": 0, "image": data}
+
+
 def _docx_paragraphs(path):
+    from docx.oxml.ns import qn
     from docx.table import Table
     from docx.text.paragraph import Paragraph
     d = docx.Document(path)
     paras = []
-    # Walk the body in order so tables stay where they appear in the text.
+    # Walk the body in order so tables and pictures stay where they appear.
     for el in d.element.body.iterchildren():
         if el.tag.endswith("}p"):
             p = Paragraph(el, d)
@@ -128,10 +135,165 @@ def _docx_paragraphs(path):
                 level = 1
             if p.text.strip():
                 paras.append(_para(p.text, level=level))
+            for blip in el.iter(qn("a:blip")):
+                part = d.part.related_parts.get(blip.get(qn("r:embed")))
+                if part is not None and getattr(part, "blob", None):
+                    paras.append(_image(part.blob))
         elif el.tag.endswith("}tbl"):
             rows = [" | ".join(c.text.strip() for c in row.cells) for row in Table(el, d).rows]
             if rows:
                 paras.append(_para("\n".join(rows)))
+    return paras
+
+
+MIN_IMAGE_PT = 40  # smaller PDF pictures are icons and bullets, not content
+
+
+def _pdf_paragraphs(path):
+    """Text, tables and pictures in reading order, page by page.
+
+    Tables are read cell by cell (rows kept whole, values exact), so they
+    aren't flattened into running text. Pictures are rendered and read
+    later by transcription. Pictures repeated on more than two pages (logos,
+    stamps, watermarks) and ones in the top/bottom margins are skipped."""
+    import io
+    from collections import Counter
+    import pdfplumber
+
+    def key(im):  # the same embedded picture object, wherever it's placed
+        return (im.get("name"), tuple(im.get("srcsize") or ()), round(im["x1"] - im["x0"]), round(im["bottom"] - im["top"]))
+
+    regions, seen = [], set()
+    with pdfplumber.open(path) as pdf:
+        pages_with = Counter()
+        for page in pdf.pages:
+            pages_with.update({key(im) for im in page.images})
+        for n, page in enumerate(pdf.pages, 1):
+            w, hgt = float(page.width), float(page.height)
+            blocks = []
+            for t in page.find_tables():
+                rows = [" | ".join(" ".join((c or "").split()) for c in row) for row in t.extract()]
+                rows = [r for r in rows if r.strip(" |")]
+                if rows:
+                    blocks.append((t.bbox[1], t.bbox[3], "table", "\n".join(rows)))
+            for im in page.images:
+                x0, top, x1, bottom = (max(0.0, im["x0"]), max(0.0, im["top"]), min(w, im["x1"]), min(hgt, im["bottom"]))
+                k = key(im)
+                if (x1 - x0 < MIN_IMAGE_PT or bottom - top < MIN_IMAGE_PT or bottom < 0.08 * hgt or top > 0.92 * hgt
+                        or pages_with[k] > 2 or k in seen):
+                    continue
+                seen.add(k)
+                try:
+                    buf = io.BytesIO()
+                    page.crop((x0, top, x1, bottom)).to_image(resolution=150).original.save(buf, "PNG")
+                except Exception:
+                    continue
+                blocks.append((top, top, "image", buf.getvalue()))
+            y = 0.0
+            for top, bottom, kind, payload in sorted(blocks, key=lambda b: b[0]):
+                if top > y + 1:
+                    regions.append((n, "text", page.crop((0, y, w, top)).extract_text() or ""))
+                regions.append((n, kind, payload))
+                y = max(y, bottom)
+            if hgt > y + 1:
+                regions.append((n, "text", page.crop((0, y, w, hgt)).extract_text() or ""))
+    widths = sorted(len(l) for _, k, t in regions if k == "text" for l in t.splitlines() if l.strip())
+    typical = widths[int(0.9 * (len(widths) - 1))] if widths else 80
+    paras = []
+    for n, kind, payload in regions:
+        if kind == "text":
+            paras += _lines_to_paragraphs(payload.splitlines(), n, typical)
+        elif kind == "table":
+            paras.append({**_para(payload, n), "table": True})
+        else:
+            paras.append(_image(payload, n))
+    return paras
+
+
+def _pdf_paragraphs_basic(path):
+    """Plain text extraction, used if the table-aware reader fails."""
+    pages = [(i, (p.extract_text() or "").splitlines()) for i, p in enumerate(PdfReader(path).pages, 1)]
+    widths = sorted(len(l) for _, lines in pages for l in lines if l.strip())
+    typical = widths[int(0.9 * (len(widths) - 1))] if widths else 80
+    return [p for i, lines in pages for p in _lines_to_paragraphs(lines, i, typical)]
+
+
+def _pptx_paragraphs(path):
+    """One section per slide: title, text, tables (rows whole), pictures and
+    speaker notes. The slide number is used like a page number."""
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    paras = []
+    for n, slide in enumerate(Presentation(path).slides, 1):
+        title_shape = slide.shapes.title
+        title = title_shape.text_frame.text.strip() if title_shape is not None and title_shape.has_text_frame else ""
+        paras.append(_para(f"Slide {n}" + (f": {title}" if title else ""), n, 1))
+
+        def walk(shapes):
+            for sh in shapes:
+                if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    walk(sh.shapes)
+                    continue
+                if title_shape is not None and sh.shape_id == title_shape.shape_id:
+                    continue
+                if sh.has_text_frame:
+                    for p in sh.text_frame.paragraphs:
+                        text = "".join(r.text for r in p.runs).strip()
+                        if text:
+                            paras.append(_para(text, n))
+                if getattr(sh, "has_table", False):
+                    rows = [" | ".join(" ".join(c.text.split()) for c in row.cells) for row in sh.table.rows]
+                    paras.append({**_para("\n".join(rows), n), "table": True})
+                if sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    try:
+                        paras.append(_image(sh.image.blob, n))
+                    except Exception:
+                        pass  # linked (not embedded) picture
+
+        walk(slide.shapes)
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+            if notes:
+                paras.append(_para("Speaker notes: " + notes, n))
+    return paras
+
+
+MAX_SHEET_ROWS = 5000
+
+
+def _cell(v):
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return "" if v is None else " ".join(str(v).split())
+
+
+def _xlsx_paragraphs(path):
+    """One section per sheet; every row written with its column names
+    ("Port: COM4 · Baud: 115200"), so a row still makes sense on its own
+    after the sheet is split into passages. Calculated values, not formulas."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True, data_only=True)
+    paras = []
+    try:
+        for ws in wb.worksheets:
+            header, rows = None, []
+            for row in ws.iter_rows(values_only=True):
+                cells = [_cell(v) for v in row]
+                if not any(cells):
+                    continue
+                if header is None:
+                    header = [c or f"Column {j + 1}" for j, c in enumerate(cells)]
+                    continue
+                parts = [f"{header[j] if j < len(header) else f'Column {j + 1}'}: {c}" for j, c in enumerate(cells) if c]
+                rows.append(_para(" · ".join(parts)))
+                if len(rows) >= MAX_SHEET_ROWS:
+                    break
+            if header is None:
+                continue
+            paras.append(_para(f"Sheet: {ws.title}", level=1))
+            paras += rows or [_para(" · ".join(header))]
+    finally:
+        wb.close()
     return paras
 
 
@@ -159,18 +321,33 @@ def _check_heading_numbers(paras):
     return paras
 
 
+IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".webp")
+
+
 def load_paragraphs(file_path: str):
-    """List of {"text", "page", "level"}: level > 0 marks a heading."""
+    """List of {"text", "page", "level"}: level > 0 marks a heading.
+    Pictures come back as {"image": bytes} placeholders (see _image)."""
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext == ".pdf":
-        pages = [(i, (p.extract_text() or "").splitlines()) for i, p in enumerate(PdfReader(file_path).pages, 1)]
-        widths = sorted(len(l) for _, lines in pages for l in lines if l.strip())
-        typical = widths[int(0.9 * (len(widths) - 1))] if widths else 80
-        return _check_heading_numbers([p for i, lines in pages for p in _lines_to_paragraphs(lines, i, typical)])
+        try:
+            paras = _pdf_paragraphs(file_path)
+        except Exception:
+            paras = _pdf_paragraphs_basic(file_path)
+        return _check_heading_numbers(paras)
 
     if ext == ".docx":
         return _docx_paragraphs(file_path)
+
+    if ext == ".pptx":
+        return _pptx_paragraphs(file_path)
+
+    if ext == ".xlsx":
+        return _xlsx_paragraphs(file_path)
+
+    if ext in IMAGE_TYPES:
+        with open(file_path, "rb") as f:
+            return [_image(f.read())]
 
     if ext in (".txt", ".md"):
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -237,8 +414,9 @@ def chunk_paragraphs(paras, chunk_size, overlap):
 
     A new section starts a new chunk (unless the current one is still tiny),
     so a chunk rarely mixes topics. Each chunk records its section path
-    ("3 Protocol > 3.2 Frame format") and pages. Overlap is carried only
-    within a section. Returns dicts: text, section, page_start, page_end.
+    ("3 Protocol > 3.2 Frame format"), pages, and the ids of pictures its
+    text was transcribed from. Overlap is carried only within a section.
+    Returns dicts: text, section, page_start, page_end, images.
     """
     if overlap >= chunk_size:
         raise ValueError("Chunk overlap must be smaller than chunk size.")
@@ -250,27 +428,28 @@ def chunk_paragraphs(paras, chunk_size, overlap):
 
     def flush(keep_overlap):
         nonlocal cur, carry, sections
-        text = "\n".join(t for t, _ in cur).strip()
-        pages = [p for _, p in cur if p]
+        text = "\n".join(t for t, *_ in cur).strip()
+        pages = [p for _, p, _ in cur if p]
         if content() > 0:
             chunks.append({
                 "text": text,
                 "section": " | ".join(dict.fromkeys(s for s in sections if s)),
                 "page_start": min(pages) if pages else 0,
                 "page_end": max(pages) if pages else 0,
+                "images": list(dict.fromkeys(i for *_, i in cur if i)),
             })
         cur, carry, sections = [], 0, [section_path()]
         if keep_overlap and overlap and text:
             tail = text[-overlap:]
             space = tail.find(" ")
             tail = tail[space + 1:] if 0 <= space < len(tail) - 1 else tail
-            cur, carry = [(tail, pages[-1] if pages else 0)], len(tail)
+            cur, carry = [(tail, pages[-1] if pages else 0, None)], len(tail)
 
     def size():
-        return sum(len(t) + 1 for t, _ in cur)
+        return sum(len(t) + 1 for t, *_ in cur)
 
     def content():  # characters that aren't overlap from the previous chunk
-        return sum(len(t) for t, _ in cur) - carry
+        return sum(len(t) for t, *_ in cur) - carry
 
     for p in paras:
         text, page, level = p["text"], p["page"], p["level"]
@@ -285,7 +464,7 @@ def chunk_paragraphs(paras, chunk_size, overlap):
             elif carry:
                 cur, carry = cur[1:], 0  # overlap text belongs to the previous section
             sections.append(section_path())
-            cur.append((text, page))
+            cur.append((text, page, None))
             continue
         if not sections:
             sections.append(section_path())
@@ -296,7 +475,7 @@ def chunk_paragraphs(paras, chunk_size, overlap):
                     flush(keep_overlap=True)
                 if cur and size() + len(piece) > chunk_size:
                     cur, carry = [], 0  # the overlap doesn't fit beside this piece
-            cur.append((piece, page))
+            cur.append((piece, page, p.get("image_id")))
     if cur:
         flush(keep_overlap=False)
     return chunks

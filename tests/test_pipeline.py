@@ -143,5 +143,74 @@ class CarryOverTests(unittest.TestCase):
         self.assertEqual(storage.get_interaction(again)["grade_source"], f"carried:{graded}")
 
 
+def _png(text="Reset command: AA 01 00 FF"):
+    import io
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (400, 120), "white")
+    ImageDraw.Draw(img).text((10, 50), text, fill="black")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+class FormatTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="localbot-formats-")
+
+    def test_xlsx_rows_carry_their_column_names(self):
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Ports"
+        ws.append(["Port", "Baud", "Parity"])
+        ws.append(["COM1", 9600, "none"])
+        ws.append(["COM2", 115200.0, None])
+        path = os.path.join(self.dir, "ports.xlsx")
+        wb.save(path)
+        texts = [p["text"] for p in documents.load_paragraphs(path)]
+        self.assertEqual(texts, ["Sheet: Ports", "Port: COM1 · Baud: 9600 · Parity: none", "Port: COM2 · Baud: 115200"])
+
+    def test_pptx_slides_tables_notes_and_pictures(self):
+        from pptx import Presentation
+        from pptx.util import Inches
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])  # title only
+        slide.shapes.title.text = "Setup"
+        table = slide.shapes.add_table(2, 2, Inches(1), Inches(2), Inches(4), Inches(1)).table
+        for r, row in enumerate([["Key", "Value"], ["Baud", "9600"]]):
+            for c, v in enumerate(row):
+                table.cell(r, c).text = v
+        pic = os.path.join(self.dir, "p.png")
+        open(pic, "wb").write(_png())
+        slide.shapes.add_picture(pic, Inches(1), Inches(4))
+        slide.notes_slide.notes_text_frame.text = "Mention the reset."
+        path = os.path.join(self.dir, "deck.pptx")
+        prs.save(path)
+        paras = documents.load_paragraphs(path)
+        self.assertEqual((paras[0]["text"], paras[0]["level"], paras[0]["page"]), ("Slide 1: Setup", 1, 1))
+        self.assertIn("Key | Value\nBaud | 9600", [p["text"] for p in paras])
+        self.assertTrue(any("image" in p for p in paras))
+        self.assertEqual(paras[-1]["text"], "Speaker notes: Mention the reset.")
+
+    def test_docx_pictures_are_found_in_place(self):
+        import docx as docxlib
+        d = docxlib.Document()
+        d.add_paragraph("Before the picture.")
+        pic = os.path.join(self.dir, "p.png")
+        open(pic, "wb").write(_png())
+        d.add_picture(pic)
+        d.add_paragraph("After the picture.")
+        path = os.path.join(self.dir, "doc.docx")
+        d.save(path)
+        kinds = ["image" if "image" in p else p["text"] for p in documents.load_paragraphs(path)]
+        self.assertEqual(kinds, ["Before the picture.", "image", "After the picture."])
+
+    def test_chunks_remember_their_pictures(self):
+        paras = [{"text": "Intro text here.", "page": 1, "level": 0},
+                 {"text": "[Picture, p. 1]\nReset command: AA 01 00 FF", "page": 1, "level": 0, "image_id": "0123456789abcdef"}]
+        chunks = documents.chunk_paragraphs(paras, 800, 0)
+        self.assertEqual(chunks[0]["images"], ["0123456789abcdef"])
+
+
 if __name__ == "__main__":
     unittest.main()

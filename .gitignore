@@ -23,10 +23,20 @@ settings.json
 # Grade exports and question sets quote your documents:
 localbot-feedback-*.json
 *.jsonl
-# Your source documents, if one is ever dropped into the project folder:
+# Your source documents and pictures, if one is ever dropped into the
+# project folder (add an exception like !docs/screenshots/*.png for README images):
 *.pdf
 *.docx
 *.doc
+*.pptx
+*.ppt
+*.xlsx
+*.xls
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.webp
 # Leftovers from earlier versions of the app:
 feedback.db
 testbench-data/

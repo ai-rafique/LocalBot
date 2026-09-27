@@ -2,7 +2,7 @@
 import { api } from "./api.js";
 import { app, menuButton } from "./main.js";
 import { control, effectText, invalidateSettings, loadSettings } from "./tuning.js";
-import { bytes, confirmDialog, debounce, dialog, fill, h, icon, toast, toastError } from "./ui.js";
+import { bytes, confirmDialog, debounce, dialog, fill, h, icon, thumb, toast, toastError } from "./ui.js";
 
 export async function render(main) {
   const page = h("div", { class: "page" });
@@ -11,7 +11,7 @@ export async function render(main) {
   main.append(page);
 
   let lib, settings, busy = null;
-  const fileInput = h("input", { type: "file", multiple: true, accept: ".pdf,.docx,.txt,.md", class: "hidden",
+  const fileInput = h("input", { type: "file", multiple: true, accept: ".pdf,.docx,.pptx,.xlsx,.txt,.md,.png,.jpg,.jpeg,.webp", class: "hidden",
     onchange: (e) => { upload([...e.target.files]); e.target.value = ""; } });
   const draft = {};
 
@@ -47,7 +47,7 @@ export async function render(main) {
     const list = docs.length ? h("div", { class: "card" }, docs.map(docRow), dropzone(true))
       : h("div", { class: "card card-pad" }, h("div", { class: "empty-state", style: { padding: "24px 0 16px" } },
           h("div", { class: "icon-circle" }, icon("docs")), h("h3", {}, "No documents yet"),
-          h("p", {}, "PDF, Word (.docx), Markdown and text files. They're copied into LocalBot's data folder and never leave this computer.")),
+          h("p", {}, "PDF, Word, PowerPoint and Excel files, Markdown and text, and pictures. Text in pictures is read too. Files are copied into LocalBot's data folder and never leave this computer.")),
         dropzone(false));
     fill(inner, head, banners, h("div", { class: "two-col" }, list, chunkPanel()));
   }
@@ -56,9 +56,10 @@ export async function render(main) {
 
   function docRow(d) {
     const meta = [`${d.chunks} passages`, d.sections ? `${d.sections} sections` : null, d.pages ? `${d.pages} pages` : null,
+      d.pictures ? `${d.pictures} picture${d.pictures === 1 ? "" : "s"} read` : null,
       bytes(d.size_bytes), d.added ? `added ${d.added}` : null].filter(Boolean).join(" · ");
     return h("div", { class: "doc-row" },
-      h("div", { class: `doc-icon ${d.type}` }, d.type.toUpperCase()),
+      h("div", { class: `doc-icon ${["png", "jpg", "jpeg", "webp"].includes(d.type) ? "img" : d.type}` }, d.type.toUpperCase()),
       h("div", { class: "doc-info" }, h("div", { class: "name", title: d.name }, d.name), h("div", { class: "meta" }, meta),
         !d.stored ? h("div", { class: "hint" }, "Original file missing: can't be re-indexed. Upload it again.") : null),
       h("button", { class: "btn sm", onclick: () => showChunks(d.name) }, "View passages"),
@@ -69,7 +70,7 @@ export async function render(main) {
     const z = h("div", { class: "dropzone", style: compact ? { margin: "12px", padding: "16px" } : {}, onclick: () => fileInput.click(),
       role: "button", tabindex: 0 },
       icon("upload"), h("div", {}, h("b", {}, "Drop files here"), " or click to browse"),
-      h("div", { class: "hint" }, "PDF · DOCX · MD · TXT — re-adding a file with the same name replaces it"));
+      h("div", { class: "hint" }, "PDF · Word · PowerPoint · Excel · Markdown · text · pictures (PNG, JPG, WEBP) — re-adding a file with the same name replaces it"));
     return z;
   }
 
@@ -129,6 +130,7 @@ export async function render(main) {
     return items.map((c) => h("div", { class: "chunk-card" },
       h("div", { class: "head" }, h("span", { class: "badge" }, `#${c.chunk}`), c.pages ? h("span", {}, `p. ${c.pages}`) : null,
         c.section ? h("span", {}, c.section) : null, h("span", { style: { marginLeft: "auto" } }, `${c.chars} chars`)),
+      (c.images || []).length ? h("div", { class: "src-thumbs" }, c.images.map(thumb)) : null,
       h("div", { class: "text" }, c.text)));
   }
 
@@ -154,15 +156,18 @@ export async function render(main) {
 
   // ---- actions
   async function upload(files) {
-    files = files.filter((f) => /\.(pdf|docx|txt|md)$/i.test(f.name));
-    if (!files.length) { toast("Use PDF, DOCX, TXT or MD files", { error: true }); return; }
-    busy = `Adding ${files.length} document${files.length === 1 ? "" : "s"}: reading, splitting into passages and embedding…`;
+    files = files.filter((f) => /\.(pdf|docx|pptx|xlsx|txt|md|png|jpe?g|webp)$/i.test(f.name));
+    if (!files.length) { toast("Use PDF, Word, PowerPoint, Excel, Markdown, text or picture files", { error: true }); return; }
+    busy = `Adding ${files.length} document${files.length === 1 ? "" : "s"}: reading text and pictures, splitting into passages and embedding… (pictures take a second or two each)`;
     draw();
     const form = new FormData();
     files.forEach((f) => form.append("files", f, f.name));
     try {
       const r = await api.upload("/api/documents", form);
-      r.added.forEach((a) => toast(`Added ${a.document}: ${a.chunks} passages`));
+      r.added.forEach((a) => toast(`Added ${a.document}: ${a.chunks} passages`
+        + (a.pictures ? `, ${a.pictures} picture${a.pictures === 1 ? "" : "s"} read` : "")
+        + (a.pictures_skipped ? ` (${a.pictures_skipped} skipped: the picture reader model can't read images; see Settings → Models)` : "")
+        + (a.pictures_unreadable ? ` (${a.pictures_unreadable} couldn't be read)` : "")));
       r.errors.forEach((e) => toast(e, { error: true }));
     } catch (e) { toastError(e); }
     busy = null;

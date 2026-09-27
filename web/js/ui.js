@@ -175,6 +175,12 @@ export function download(filename, text, type = "application/json") {
   const a = h("a", { href: URL.createObjectURL(new Blob([text], { type })), download: filename });
   document.body.append(a); a.click(); a.remove();
 }
+// A picture a passage was read from; opens full size in a new tab.
+export function thumb(id) {
+  return h("a", { href: `/api/images/${id}`, target: "_blank", rel: "noopener", title: "The picture this text was read from" },
+    h("img", { src: `/api/images/${id}`, alt: "Picture from the document", loading: "lazy" }));
+}
+
 export function tip(text) { return h("span", { class: "info-tip", "data-tip": text, "data-tip-wide": "" }, "?"); }
 export function gradeBadge(grade) {
   if (!grade) return h("span", { class: "badge" }, "Not graded");

@@ -1,7 +1,8 @@
 # LocalBot
 
 Private question answering over your own documents. Add PDF, Word,
-Markdown or text files, ask questions in a chat, and get answers grounded
+PowerPoint and Excel files, Markdown, text and pictures, ask questions in
+a chat, and get answers grounded
 in those documents with citations you can check. Everything runs on your
 computer: the models (through Ollama), the search index and all data.
 
@@ -74,11 +75,19 @@ documented and answers direct questions with checkable citations. It is
 not yet reliable for multi-step reasoning or for copying long exact values;
 the cited sources and the warnings under each answer are there so you can
 check. In 34 of the 43 imperfect answers the right text *was* in front of
-the model, so a stronger model is the biggest remaining lever — the
-experiment area is built to measure exactly that.
+the model, so most remaining errors are reading errors, not search errors.
 
-For comparison, `qwen3.5:0.8b` runs about 1.6× faster (~80 tokens/s) on
-the same GPU but reads passages less accurately.
+Model size on a 4 GB GPU, compared on this setup:
+
+- `qwen3.5:0.8b` — about 1.6× faster (~80 tokens/s), but reads passages
+  noticeably less accurately.
+- `qwen3.5:2b` — **the sweet spot**: fits entirely on the GPU and, tuned
+  as in the defaults, is both fast and accurate.
+- `qwen3.5:4b` — doesn't fit in 4 GB, so part of it runs on the CPU. Much
+  slower, and not better in practice here.
+
+On a larger GPU a bigger model may pay off; the experiment area is built
+to measure that on your own questions before you switch.
 
 ## Quick start
 
@@ -107,7 +116,7 @@ the same GPU but reads passages less accurately.
    python app.py
    ```
 
-   Your browser opens <http://127.0.0.1:7860>. Go to **Documents**, add
+   Your browser opens <http://127.0.0.1:64000>. Go to **Documents**, add
    files, then ask away in **Chat**.
 
 ## The five screens
@@ -136,8 +145,30 @@ low model confidence.
 
 ### Documents
 Your library. Drop files anywhere on the page to add them. Each document
-shows its passages, sections and pages; **View passages** shows exactly
-what the model can read.
+shows its passages, sections, pages and pictures read; **View passages**
+shows exactly what the model can read.
+
+| Format | What's read |
+|---|---|
+| PDF | Text with headings and pages; **tables cell by cell** (rows kept whole, values exact); embedded pictures |
+| Word (.docx) | Text with heading styles, tables, pictures in place |
+| PowerPoint (.pptx) | One section per slide: title, text, tables, pictures, speaker notes |
+| Excel (.xlsx) | One section per sheet; each row written with its column names ("Port: COM1 · Baud: 9600") |
+| Markdown, text | Headings, paragraphs, code blocks |
+| Pictures (PNG, JPG, WEBP) | Transcribed |
+
+**Pictures** — inside documents or on their own — are transcribed by the
+**picture reader** model (Settings → Models; default `qwen3.5:2b`, which
+accepts images) when the document is added (a second or two each, remembered
+afterwards), so their text becomes searchable. Text in screenshots reads
+well; diagrams and photos only get a short description. Passages read
+from a picture show its thumbnail in Sources so you can check them against
+the original. Logos repeated on every page are skipped. Pictures can be
+switched off in Settings → Chunking.
+
+Limits: Excel answers lookups ("what's the baud rate on COM2?"), not
+calculations across many rows. Scanned PDFs (pages that are pictures of
+text) aren't supported yet.
 
 The **How documents are split** panel previews new chunk settings live —
 passage count, sizes, sample passages — before you commit. **Apply and
@@ -261,6 +292,7 @@ Everything LocalBot stores is in the `data/` folder:
 | Path | Contents |
 |---|---|
 | `data/documents/` | Copies of the files you added |
+| `data/images/` | Pictures found in your documents, and their transcripts |
 | `data/chroma/` | The search index |
 | `data/localbot.db` | Conversations, every answer with its prompt and sources, grades, question sets, runs |
 | `data/settings.json` | Settings you changed from the defaults |
@@ -281,7 +313,9 @@ it elsewhere; `LOCALBOT_PORT` changes the port.
 app.py                  entry point (python app.py)
 localbot/
   config.py             paths, settings schema (types, ranges, help, effects), presets
-  documents.py          reading files into paragraphs; structure-aware chunking
+  documents.py          reading PDF/Word/PowerPoint/Excel/text into paragraphs, tables and
+                        pictures; structure-aware chunking
+  vision.py             transcribing pictures with the chat model (cached)
   index.py              library, embeddings, BM25 keyword index, temporary indexes
   retrieval.py          hybrid search, reciprocal rank fusion, LLM reranking
   generation.py         prompt, streaming answer, confidence, faithfulness checks
@@ -312,5 +346,8 @@ thread, so a background run never changes what the chat uses.
   fit in GPU memory. Pick a smaller model, reduce the context window, or
   close other GPU-heavy apps.
 - **"Settings changed since the index was built"** — re-index in Documents.
-- **Scanned PDFs add no passages** — they contain images, not text; run
-  OCR on them first.
+- **Scanned PDFs add no passages** — their pages are pictures of text,
+  which isn't supported yet; run OCR on them first.
+- **"Pictures skipped"** when adding documents — the picture reader model
+  can't read images. Choose one that can (e.g. `qwen3.5:2b`) in Settings →
+  Models, or switch pictures off.

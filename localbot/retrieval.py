@@ -41,6 +41,7 @@ def _hit(cid, doc, meta):
         "section": meta.get("section", ""), "page_start": meta.get("page_start", 0),
         "page_end": meta.get("page_end", 0), "chunk_size": meta.get("chunk_size"),
         "overlap": meta.get("overlap"), "used": False,
+        "images": [i for i in (meta.get("images") or "").split(",") if i],
     }
 
 

@@ -3,7 +3,7 @@ import { api, stream } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
 import { app, menuButton, renameChat } from "./main.js";
 import { control, effectText, invalidateSettings, loadModels, loadSettings } from "./tuning.js";
-import { add, copyText, fill, h, icon, num, popover, segmented, switchEl, toast, toastError } from "./ui.js";
+import { add, copyText, fill, h, icon, num, popover, segmented, switchEl, thumb, toast, toastError } from "./ui.js";
 
 const STAGES = { search: "Searching your documents", rerank: "Reranking passages", write: "Writing the answer",
                  verify: "Checking each statement against its sources" };
@@ -434,6 +434,8 @@ export function sourcesPanel(t) {
         used ? h("span", { class: "badge accent" }, label) : h("span", { class: "badge", title: "Below the relevance cutoff, so not sent to the model" }, "not sent"),
         h("span", { class: "name", title: x.source }, x.source)),
       where ? h("div", { class: "src-where", title: where }, where) : null,
+      (x.images || []).length ? h("div", { class: "src-thumbs" }, x.images.map(thumb),
+        h("span", { class: "hint" }, "Text read from this picture — check it against the original.")) : null,
       h("div", { class: "score-bar" }, h("div", { style: { width: `${Math.max(2, Math.min(100, (x.score ?? 0) * 100))}%` } })),
       h("div", { class: "src-scores" },
         h("span", {}, `${kind} ${num(x.score)}`),

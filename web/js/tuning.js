@@ -33,6 +33,14 @@ export function effectText(key, value, v, ins, models = []) {
       const fit = m.fits_gpu === false ? " May not fit fully on the GPU, so it will run slower." : m.fits_gpu ? " Fits on the GPU." : "";
       return `${m.parameters || ""} ${m.quantization || ""} · ${m.size_gb} GB.${fit}${gpu}`.trim();
     }
+    case "vision_model": {
+      const m = models.find((x) => x.name === value || x.name === `${value}:latest`);
+      if (!m) return `Not installed. Install it under Models below, or run: ollama pull ${value}`;
+      const sees = (m.capabilities || []).includes("vision");
+      if (!sees) return "This model can't read images: pictures would be skipped. Choose one that accepts images, e.g. qwen3.5:2b.";
+      return value === v.llm_model ? "Reads pictures; it's also your chat model, so no extra memory is needed while adding documents."
+        : "Reads pictures. While adding documents it's loaded alongside the chat model, so expect a short model swap on a small GPU.";
+    }
     case "embed_model":
       return value !== ins.indexed_embed ? "Different from the index: re-index documents after saving." : "Matches the current index.";
     case "top_k": {
