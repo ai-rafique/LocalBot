@@ -45,6 +45,7 @@ Developed and measured on:
 
 | | |
 |---|---|
+| Hardware/Software | Description |
 | OS | Windows 11 (build 26200) |
 | GPU | NVIDIA GeForce RTX 3050 Laptop, 4 GB VRAM (driver 616.56) |
 | Ollama | 0.34 |
