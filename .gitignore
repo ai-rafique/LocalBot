@@ -1,0 +1,68 @@
+# =============================================================================
+# LocalBot .gitignore
+#
+# Rule: code goes in the repo; nothing the app learns about YOUR documents
+# does. Private material lives in data/ — but the patterns below also catch
+# it anywhere else, in case a file is ever saved or moved outside data/.
+# =============================================================================
+
+# --- Private data (documents, index, answers, grades, settings) -------------
+data/
+# Anything the app can produce, wherever it ends up:
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+chroma/
+chroma_db/
+documents/
+index_state.json
+settings.json
+# Grade exports and question sets quote your documents:
+localbot-feedback-*.json
+*.jsonl
+# Your source documents, if one is ever dropped into the project folder:
+*.pdf
+*.docx
+*.doc
+# Leftovers from earlier versions of the app:
+feedback.db
+testbench-data/
+backup-*/
+
+# --- Local notes: root-level Markdown other than the README stays private ---
+/*.md
+!/README.md
+
+# --- Python ------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Secrets and local config ----------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+
+# --- Editors and OS ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs ------------------------------------------------------------------------
+*.log
