@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS interactions (
     question TEXT, answer TEXT,
     messages TEXT, hits TEXT, memory TEXT, settings TEXT, metrics TEXT,
     weak_tokens TEXT, checks TEXT,
-    grade TEXT, tags TEXT, reason TEXT, correction TEXT, graded_at TEXT
+    grade TEXT, tags TEXT, reason TEXT, correction TEXT, graded_at TEXT,
+    -- NULL: graded by the user. "carried:<id>": copied from that identical,
+    -- user-graded answer to the same question.
+    grade_source TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_interactions_conv ON interactions(conversation_id, ts);
 CREATE INDEX IF NOT EXISTS ix_interactions_run ON interactions(run_id);
@@ -73,6 +76,10 @@ def init():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.executescript(SCHEMA)
+        # Databases from earlier versions lack newer columns; add them in place.
+        have = {r[1] for r in conn.execute("PRAGMA table_info(interactions)")}
+        if "grade_source" not in have:
+            conn.execute("ALTER TABLE interactions ADD COLUMN grade_source TEXT")
 
 
 # --- Conversations -----------------------------------------------------------

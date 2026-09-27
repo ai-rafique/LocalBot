@@ -16,8 +16,23 @@ function inline(text, citeCount) {
   return s;
 }
 
-export function renderMarkdown(src, citeCount) {
-  const lines = String(src || "").replace(/\r\n?/g, "\n").split("\n");
+// marks: [{text, title}] — sentences to highlight (e.g. statements the
+// claim check found unsupported). They're wrapped in placeholder characters
+// before rendering and turned into <mark> afterwards, so escaping and the
+// Markdown rules apply to them as usual.
+export function renderMarkdown(src, citeCount, marks = []) {
+  let text = String(src || "").replace(/\r\n?/g, "\n");
+  marks.forEach((m, i) => {
+    const at = m.text ? text.indexOf(m.text) : -1;
+    if (at >= 0) text = text.slice(0, at) + `\u0001${i}\u0003` + m.text + "\u0002" + text.slice(at + m.text.length);
+  });
+  return renderBlocks(text, citeCount)
+    .replace(/\u0001(\d+)\u0003/g, (_, i) => `<mark class="claim-flag" title="${esc(marks[+i].title || "")}">`)
+    .replace(/\u0002/g, "</mark>");
+}
+
+function renderBlocks(src, citeCount) {
+  const lines = src.split("\n");
   const out = [];
   let i = 0;
   const isTableSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);

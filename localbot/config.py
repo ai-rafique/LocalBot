@@ -114,6 +114,17 @@ SCHEMA = [
     _s("history_turns", "answering", "Conversation memory", "int", 4,
        "How many earlier question/answer pairs are sent along with a new question.",
        "Search still uses only the new question.", min=0, max=10, step=1, unit="exchanges"),
+    _s("verify_claims", "answering", "Check each statement", "bool", True,
+       "After answering, the model checks every sentence against the passage it cites and marks "
+       "sentences the passages don't support.",
+       "Catches wrong details inside otherwise good answers; adds about 0.2 s per sentence."),
+    # Calibrated on 100 hand-graded answers (qwen3.5:2b): at 0.7 the check
+    # flagged 37% of partial/bad answers and 13 of 27 containing a false
+    # statement, with false alarms on 11% of good ones; 0.5 caught only 20%.
+    _s("claim_min_score", "answering", "Statement support threshold", "float", 0.7,
+       "Sentences the check scores below this are marked as not supported by their sources.",
+       "Higher marks more sentences: more caution, more false alarms.",
+       min=0.05, max=0.95, step=0.05, advanced=True),
     _s("low_confidence", "answering", "Low-confidence warning", "float", 0.62,
        "Answers whose average token probability is below this get a warning.",
        "Model-specific: recalibrate from your grades when you change the chat model.",

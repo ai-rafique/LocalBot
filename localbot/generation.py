@@ -27,6 +27,47 @@ TECH_TERM_RE = re.compile(
 )
 
 
+CLAIM_SYSTEM = (
+    'Judge whether the Document supports the Statement. Note that the answer can only be "yes" or "no".'
+)
+MAX_CLAIMS = 8  # bounds the added time on long answers
+
+
+def split_claims(answer):
+    """The sentences of an answer worth checking, each with the passage
+    numbers it cites. Skips headings, lead-ins ("Answer:") and refusals."""
+    out = []
+    for line in answer.splitlines():
+        line = re.sub(r"^\s*(?:[-*+•]|\d+[.)])\s+", "", line).strip()
+        if not line or line.startswith(("#", "|", "```")):
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9`*\[(])", line):
+            sent = sent.strip()
+            claim = re.sub(r"\s*\[V?\d+\]", "", sent).strip(" *")
+            if len(claim) < 25 or claim.endswith(":") or REFUSAL_RE.search(claim):
+                continue
+            out.append({"text": sent, "claim": claim, "cites": sorted({int(n) for n in re.findall(r"\[(\d+)\]", sent)})})
+    return out[:MAX_CLAIMS]
+
+
+def check_claims(answer, hits, memory_items=()):
+    """Score how well each statement is supported by the passages it cites
+    (all passages sent, when it cites none). A cheap second read that catches
+    wrong details the term check can't: swapped rows, invented behaviour,
+    a false premise repeated as fact."""
+    claims = split_claims(answer)
+    extra = [{"source": "verified answer", "section": "", "text": m["answer"]} for m in memory_items]
+    for c in claims:
+        cited = [hits[n - 1] for n in c["cites"] if 1 <= n <= len(hits)]
+        passages = (cited or list(hits)) + extra
+        doc = "\n\n".join(f"{documents.chunk_header(h)}\n{h['text']}" for h in passages)
+        # Document first, statement last: consecutive statements that cite
+        # the same passages reuse Ollama's cached prompt prefix.
+        c["score"] = round(retrieval.yes_probability(CLAIM_SYSTEM, f"<Document>: {doc}\n<Statement>: {c['claim']}"), 3)
+        c["supported"] = c["score"] >= S.claim_min_score
+    return claims
+
+
 def build_prompt(query, hits, memory_items=()):
     parts = []
     if memory_items:
@@ -150,6 +191,9 @@ def warnings(answer, hits_used, checks, metrics):
                     + ", which isn't one of the sources"})
     if hits_used and not checks.get("cited") and not REFUSAL_RE.search(answer):
         out.append({"kind": "uncited", "text": "No source cited"})
+    bad = [x for x in checks.get("claims", []) if not x["supported"]]
+    if bad:
+        out.append({"kind": "claims", "text": f"{len(bad)} statement{'s' if len(bad) > 1 else ''} not supported by the cited sources"})
     c = metrics.get("confidence")
     if c is not None and c < S.low_confidence:
         out.append({"kind": "confidence", "text": f"Low model confidence ({c:.2f})"})
@@ -209,13 +253,20 @@ def answer(question, conversation_id=None, origin="chat", run_id=None, qid=None,
         text = NO_CONTEXT_ANSWER
         yield {"type": "token", "text": text}
 
-    t_end = time.perf_counter()
     text = clean_answer(text)
+    claims, verify_ms = [], 0.0
+    if S.verify_claims and hits and text and not REFUSAL_RE.search(text) and not retrieval_only:
+        yield {"type": "stage", "stage": "verify"}
+        t_v = time.perf_counter()
+        claims = check_claims(text, hits, memory_items)
+        verify_ms = (time.perf_counter() - t_v) * 1000
+    t_end = time.perf_counter()
     eval_count = (final.eval_count or 0) if final else 0
     eval_s = (final.eval_duration or 0) / 1e9 if final else 0
     conf, weak_tokens = confidence(token_lps)
     checks = (faithfulness(text, hits, memory_items, question) if (hits or memory_items) and text
               else {"unsupported": [], "bad_citations": [], "cited": False})
+    checks["claims"] = claims
     scores = [h["score"] for h in all_hits]
     metrics = {
         "k": S.top_k, "min_score": float(min_score), "hybrid": S.hybrid, "rerank": rerank,
@@ -229,7 +280,8 @@ def answer(question, conversation_id=None, origin="chat", run_id=None, qid=None,
         "unsupported_terms": len(checks["unsupported"]), "bad_citations": len(checks["bad_citations"]),
         "cited": checks["cited"],
         "embed_ms": round(timings["embed_ms"], 1), "search_ms": round(timings["search_ms"], 1),
-        "rerank_ms": round(timings["rerank_ms"], 1),
+        "rerank_ms": round(timings["rerank_ms"], 1), "verify_ms": round(verify_ms, 1),
+        "claims_checked": len(claims), "claims_unsupported": sum(1 for c in claims if not c["supported"]),
         "ttft_s": round((first_token_at or t_end) - t_start, 2), "total_s": round(t_end - t_start, 2),
         "prompt_tokens": (final.prompt_eval_count or 0) if final else 0, "answer_tokens": eval_count,
         "hit_length_cap": eval_count >= S.num_predict,

@@ -122,6 +122,12 @@ low model confidence.
 
 - 👍 / 👎 grade an answer on the spot; the grade icon opens a detailed
   grade (partial, what went wrong, why, the correct answer).
+- **Statement check**: after writing, the model checks each sentence
+  against the passage it cites. Sentences the passages don't support are
+  highlighted, and the **Checks** tab lists every statement with its
+  score. On 100 graded answers it flagged 37% of the partial or bad ones
+  while false-alarming on 11% of good ones; it adds well under a second
+  per answer and can be switched off in Settings.
 - The **details panel** (right) shows every retrieved passage with its
   score and whether it was sent, a timing breakdown, and the exact prompt
   the model saw.
@@ -151,7 +157,10 @@ then grade:
 - **Correct answer** (optional)
 
 `Ctrl+Enter` saves and moves to the next one; `J`/`K` move between
-answers. Good or corrected chat answers are **reused**: when a nearly
+answers. When an experiment produces an answer word-for-word identical to
+one you already graded for the same question, it **inherits that grade**
+(marked ↺ carried over; filter "Carried over" to review them). A repeat
+run typically starts with about half its answers graded. Good or corrected chat answers are **reused**: when a nearly
 identical question comes up, your verified answer is given to the model
 alongside the passages. **Export** writes grades and tuning signals to a
 JSON file; passage text and prompts are never included.
@@ -170,6 +179,7 @@ one setting — and reports:
 | Misread passages | Facts were in the passages but not in the answer — measures the model |
 | Refused when it should / Wrongly refused | Behaviour on questions the documents can't answer, and on ones they can |
 | Flagged terms | Answers with numbers or identifiers found in no source |
+| Unsupported statements | Answers with a sentence the statement check found unsupported |
 
 Runs go one at a time in the background. **Passages only** runs skip
 answer writing and take seconds — ideal for tuning search, the relevance

@@ -109,5 +109,39 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(len(errors), 2)
 
 
+class ClaimSplitTests(unittest.TestCase):
+    def test_keeps_checkable_sentences_with_their_citations(self):
+        answer = ("Answer:\nThe loader uses port A at 9600 baud [1]. It retries three times before giving up [2].\n"
+                  "- The reset command is AA 01 00 FF [1].\n- Ok.\nI don't know what the default is.")
+        claims = generation.split_claims(answer)
+        self.assertEqual([c["cites"] for c in claims], [[1], [2], [1]])
+        self.assertEqual(claims[2]["claim"], "The reset command is AA 01 00 FF.")
+        self.assertTrue(all(c["text"] in answer for c in claims))  # needed for highlighting
+
+
+class CarryOverTests(unittest.TestCase):
+    def test_only_identical_answers_to_hand_graded_ones_inherit(self):
+        from localbot import storage
+        storage.init()
+        graded = storage.log_interaction(origin="experiment", question="Q1?", answer="Same answer.")
+        storage.query("UPDATE interactions SET grade = 'bad', tags = '[\"wrong\"]', reason = 'r', graded_at = ? WHERE id = ?",
+                      (storage.now(), graded))
+        run = storage.new_id()
+        same = storage.log_interaction(origin="experiment", run_id=run, question="Q1?", answer="Same answer.")
+        other = storage.log_interaction(origin="experiment", run_id=run, question="Q1?", answer="Different answer.")
+        for qid, iid in (("a", same), ("b", other)):
+            storage.query("INSERT INTO run_results VALUES (?, ?, ?, ?)", (run, qid, iid, "{}"))
+        self.assertEqual(experiments.carry_over_grades(run), 1)
+        row = storage.get_interaction(same)
+        self.assertEqual((row["grade"], row["tags"], row["grade_source"]), ("bad", ["wrong"], f"carried:{graded}"))
+        self.assertIsNone(storage.get_interaction(other)["grade"])
+        # A carried grade is never used as a source for another carry.
+        run2 = storage.new_id()
+        again = storage.log_interaction(origin="experiment", run_id=run2, question="Q1?", answer="Same answer.")
+        storage.query("INSERT INTO run_results VALUES (?, ?, ?, ?)", (run2, "a", again, "{}"))
+        experiments.carry_over_grades(run2)
+        self.assertEqual(storage.get_interaction(again)["grade_source"], f"carried:{graded}")
+
+
 if __name__ == "__main__":
     unittest.main()

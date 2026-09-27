@@ -6,7 +6,7 @@ import { add, confirmDialog, dialog, fill, gradeBadge, h, icon, num, pct, segmen
 
 // What each metric means, and whether higher is better (for coloring deltas).
 const METRICS = [
-  { key: "good_rate", label: "Graded good", fmt: pct, up: true, help: "Share of graded answers you marked good. The most trustworthy measure — grade in Evaluate." },
+  { key: "good_rate", label: "Graded good", fmt: pct, up: true, help: "Share of graded answers you marked good. The most trustworthy measure — grade in Evaluate. Answers identical to ones you already graded for the same question get that grade automatically (carried over)." },
   { key: "auto_correct", label: "Auto-correct", fmt: pct, up: true, help: "Answerable questions whose answer contains every expected fact and isn't a refusal. Can't see wrong extra claims." },
   { key: "fact_coverage", label: "Fact coverage", fmt: pct, up: true, help: "Average share of expected facts found in the answers." },
   { key: "context_recall", label: "Context recall", fmt: pct, up: true, help: "Answerable questions where the passages sent to the model contained every expected fact. Measures retrieval." },
@@ -15,6 +15,7 @@ const METRICS = [
   { key: "false_refusals", label: "Wrongly refused", fmt: pct, up: false, help: "Answerable questions answered with \"I don't know\"." },
   { key: "generation_misses", label: "Misread passages", fmt: (x) => x ?? "—", up: false, help: "The expected facts were in the passages sent, but not in the answer: the model misread or ignored them." },
   { key: "flagged", label: "Flagged terms", fmt: (x) => x ?? "—", up: false, help: "Answers containing numbers or identifiers that appear in none of their sources." },
+  { key: "claims_flagged", label: "Unsupported statements", fmt: (x) => x ?? "—", up: false, help: "Answers with at least one sentence the statement check found unsupported by its cited sources." },
   { key: "latency_s", label: "Seconds per question", fmt: (x) => num(x, 1), up: false, help: "Average time per question." },
 ];
 
@@ -336,7 +337,7 @@ async function runDetail({ inner }, id) {
     ];
     const cards = METRICS.filter((m) => s[m.key] !== undefined && s[m.key] !== null).map((m) => h("div", { class: "stat" },
       h("div", { class: "label" }, m.label, tip(m.help)), h("div", { class: "value" }, m.fmt(s[m.key])),
-      m.key === "good_rate" ? h("div", { class: "sub" }, `${s.graded} of ${s.questions} graded`) : null));
+      m.key === "good_rate" ? h("div", { class: "sub" }, `${s.graded} of ${s.questions} graded${s.carried ? ` (${s.carried} carried over)` : ""}`) : null));
     if (!s.graded && !r.config.retrieval_only && r.status === "done") cards.unshift(h("div", { class: "stat", style: { gridColumn: "span 2" } },
       h("div", { class: "label" }, "Graded good"), h("div", { class: "value", style: { fontSize: "15px", fontWeight: 500 } }, "Not graded yet"),
       h("a", { href: `#/evaluate?run=${r.id}&status=ungraded`, class: "sub" }, "Grade the answers →")));
@@ -364,7 +365,8 @@ async function runDetail({ inner }, id) {
           h("td", { class: "mono" }, x.qid), h("td", {}, x.variant), h("td", { style: { maxWidth: "420px" } }, x.question),
           r.config.retrieval_only ? null : h("td", {}, x.auto_label ? h("span", { class: `label-chip ${x.auto_label}` }, x.auto_label) : "—"),
           h("td", { class: "num" }, x.answerable ? pct(x.context_coverage) : h("span", { class: "faint" }, "n/a")),
-          r.config.retrieval_only ? null : h("td", {}, x.grade ? gradeBadge(x.grade) : h("span", { class: "faint" }, "—")),
+          r.config.retrieval_only ? null : h("td", {}, x.grade ? h("span", { title: x.carried ? "Carried over from an identical answer you graded" : null },
+            gradeBadge(x.grade), x.carried ? " ↺" : null) : h("span", { class: "faint" }, "—")),
           h("td", { class: "num" }, num(x.total_s, 1))))))));
     clearTimeout(timer);
     if (live) timer = setTimeout(load, 2000);

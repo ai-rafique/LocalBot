@@ -44,23 +44,14 @@ def _hit(cid, doc, meta):
     }
 
 
-def rerank_score(query, hit):
-    """P(yes) that the passage answers the question, from the model's first
-    token: the Qwen3-Reranker recipe run on the chat model already loaded.
-    Same options as answering, so Ollama doesn't reload the model."""
-    passage = f"{documents.chunk_header(hit)}\n{hit['text']}"
+def yes_probability(system, user):
+    """P("yes") vs P("no") for the model's first token — the Qwen3-Reranker
+    recipe, run on the chat model already loaded. Same options as answering,
+    so Ollama doesn't reload the model. Used for reranking and claim checks."""
     r = ollama.chat(
         model=S.rerank_model_name(), think=False, logprobs=True, top_logprobs=10,
         keep_alive=S.keep_alive, options={**gen_options(), "num_predict": 1},
-        messages=[
-            {"role": "system", "content": RERANK_SYSTEM},
-            # The question comes before the passage so Ollama can reuse the
-            # cached prompt prefix across the candidates of one question.
-            {"role": "user", "content": (
-                "<Instruct>: Given a question about a technical document, judge whether the "
-                f"passage contains information that answers it\n<Query>: {query}\n<Document>: {passage}"
-            )},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
     )
     yes = no = 0.0
     for alt in (r.logprobs[0].top_logprobs or []) if r.logprobs else []:
@@ -70,6 +61,16 @@ def rerank_score(query, hit):
         elif word == "no":
             no += math.exp(alt.logprob)
     return yes / (yes + no) if yes + no else 0.0
+
+
+def rerank_score(query, hit):
+    """P(yes) that the passage answers the question."""
+    passage = f"{documents.chunk_header(hit)}\n{hit['text']}"
+    # The question comes before the passage so Ollama can reuse the cached
+    # prompt prefix across the candidates of one question.
+    return yes_probability(RERANK_SYSTEM, (
+        "<Instruct>: Given a question about a technical document, judge whether the "
+        f"passage contains information that answers it\n<Query>: {query}\n<Document>: {passage}"))
 
 
 def retrieve(query, k=None, hybrid=None, rerank=None):

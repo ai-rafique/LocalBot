@@ -264,6 +264,12 @@ table.table { width: 100%; border-collapse: collapse; }
 .cite { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 4px; margin: 0 1px; border-radius: 5px; border: 0; background: var(--accent-soft); color: var(--accent-text); font: 700 11px var(--font); cursor: pointer; vertical-align: 1px; }
 .cite:hover { background: var(--accent); color: #fff; }
 .cite.invalid { background: var(--bad-soft); color: var(--bad); }
+mark.claim-flag { background: var(--warn-soft); color: inherit; text-decoration: underline wavy var(--warn); text-underline-offset: 3px; border-radius: 3px; padding: 0 1px; cursor: help; }
+.claim-row { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.claim-row:last-child { border-bottom: 0; }
+.claim-row .mark { flex: none; width: 18px; text-align: center; font-weight: 700; }
+.claim-row.ok .mark { color: var(--good); } .claim-row.bad .mark { color: var(--warn); }
+.claim-row .score { flex: none; margin-left: auto; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
 /* Inspector */
 .inspector { width: var(--inspector-w); flex: none; border-left: 1px solid var(--border); background: var(--bg-subtle); display: flex; flex-direction: column; min-height: 0; }

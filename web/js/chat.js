@@ -5,7 +5,8 @@ import { app, menuButton, renameChat } from "./main.js";
 import { control, effectText, invalidateSettings, loadModels, loadSettings } from "./tuning.js";
 import { add, copyText, fill, h, icon, num, popover, segmented, switchEl, toast, toastError } from "./ui.js";
 
-const STAGES = { search: "Searching your documents", rerank: "Reranking passages", write: "Writing the answer" };
+const STAGES = { search: "Searching your documents", rerank: "Reranking passages", write: "Writing the answer",
+                 verify: "Checking each statement against its sources" };
 let tagVocab = null;
 
 export async function render(main, route) {
@@ -108,7 +109,7 @@ export async function render(main, route) {
   function botNode(t) {
     const used = usedHits(t);
     const body = h("div", { class: "body" });
-    const md = h("div", { class: "md", html: renderMarkdown(t.answer, used.length) });
+    const md = h("div", { class: "md", html: renderMarkdown(t.answer, used.length, claimMarks(t)) });
     md.addEventListener("click", (e) => {
       const c = e.target.closest(".cite");
       if (c) { state.selected = t.id; openInspector("sources", c.dataset.cite); }
@@ -121,7 +122,12 @@ export async function render(main, route) {
     (t.memory || []).forEach((m, i) => meta.append(h("button", { class: "src-chip", title: "Your verified answer to: " + m.question,
       onclick: () => { state.selected = t.id; openInspector("sources", `V${i + 1}`); } },
       h("span", { class: "n" }, `V${i + 1}`), h("span", { class: "t" }, "Verified answer"))));
-    for (const w of t.checks?.warnings || []) meta.append(h("span", { class: "warning-chip", title: w.text }, icon("alert"), w.text));
+    for (const w of t.checks?.warnings || []) {
+      meta.append(w.kind === "claims"
+        ? h("button", { class: "warning-chip", style: { border: 0, cursor: "pointer" }, title: "Show which statements",
+            onclick: () => { state.selected = t.id; openInspector("checks"); } }, icon("alert"), w.text)
+        : h("span", { class: "warning-chip", title: w.text }, icon("alert"), w.text));
+    }
     if (meta.childNodes.length) body.append(meta);
     body.append(actions(t));
     return h("div", { class: "msg bot" + (t.id === state.selected && state.inspector ? " selected" : ""), "data-id": t.id },
@@ -218,7 +224,7 @@ export async function render(main, route) {
     inspectBtn.classList.toggle("on", state.inspector);
     if (!state.inspector) return;
     const t = state.turns.find((x) => x.id === state.selected) || state.live;
-    const tabs = h("div", { class: "tabs" }, [["sources", "Sources"], ["trace", "Trace"], ["prompt", "Prompt"]].map(([k, l]) =>
+    const tabs = h("div", { class: "tabs" }, [["sources", "Sources"], ["checks", "Checks"], ["trace", "Trace"], ["prompt", "Prompt"]].map(([k, l]) =>
       h("a", { href: "#", class: state.tab === k ? "active" : "", onclick: (e) => { e.preventDefault(); state.tab = k; renderInspector(); } }, l)));
     const body = h("div", { class: "inspector-body" });
     fill(inspector,
@@ -227,6 +233,7 @@ export async function render(main, route) {
       tabs, body);
     if (!t) { body.append(h("p", { class: "muted" }, "Ask a question to see which passages were used, how long each step took, and the exact prompt.")); return; }
     if (state.tab === "sources") add(body, sourcesPanel(t));
+    else if (state.tab === "checks") add(body, checksPanel(t));
     else if (state.tab === "trace") add(body, tracePanel(t));
     else promptPanel(t, body);
   }
@@ -283,6 +290,7 @@ export async function render(main, route) {
         } else if (ev.type === "stage") {
           stageEl.lastChild.textContent = ev.stage === "search" && ev.rerank ? "Searching and reranking passages" : STAGES[ev.stage] || ev.stage;
           stageEl.classList.remove("hidden");
+          if (ev.stage === "verify") { mdEl.classList.remove("caret"); bot.querySelector(".body").append(stageEl); }
         } else if (ev.type === "sources") {
           live.hits = ev.hits; live.memory = ev.memory;
           if (state.inspector && !state.selected) renderInspector();
@@ -372,6 +380,33 @@ function presetName(s) {
   return k ? s.presets[k].label : "Custom";
 }
 
+// Unsupported statements, for highlighting in the answer text.
+export function claimMarks(t) {
+  return (t.checks?.claims || []).filter((c) => !c.supported)
+    .map((c) => ({ text: c.text, title: `Not supported by the cited sources (support ${c.score.toFixed(2)})` }));
+}
+
+// Every checked statement with its support score.
+export function checksPanel(t) {
+  const claims = t.checks?.claims;
+  const out = [];
+  if (!claims) out.push(h("p", { class: "muted" }, "Statements weren't checked for this answer (the check was off, or the answer came before it existed)."));
+  else if (!claims.length) out.push(h("p", { class: "muted" }, "No statements to check (a refusal, or only short sentences)."));
+  else {
+    const bad = claims.filter((c) => !c.supported).length;
+    out.push(h("p", { class: "hint", style: { marginTop: 0 } },
+      `${claims.length - bad} of ${claims.length} statements supported by their sources. Each is checked against the passages it cites (all passages, if it cites none); scores are the model's confidence that the passage supports it.`));
+    out.push(h("div", {}, claims.map((c) => h("div", { class: "claim-row " + (c.supported ? "ok" : "bad") },
+      h("span", { class: "mark" }, c.supported ? "✓" : "⚠"),
+      h("span", {}, c.text, c.cites.length ? h("span", { class: "faint" }, ` · checked against [${c.cites.join("], [")}]`) : h("span", { class: "faint" }, " · checked against all sources")),
+      h("span", { class: "score" }, c.score.toFixed(2))))));
+  }
+  const w = (t.checks?.warnings || []).filter((x) => x.kind !== "claims");
+  if (w.length) out.push(h("div", { class: "section-title", style: { marginTop: "16px" } }, "Other checks"),
+    ...w.map((x) => h("div", { class: "warning-chip", style: { marginBottom: "6px" } }, icon("alert"), x.text)));
+  return out;
+}
+
 function shortName(name) { return name.length > 28 ? name.slice(0, 25) + "…" : name; }
 function pages(x) {
   const a = x.page_start, b = x.page_end;
@@ -414,7 +449,8 @@ export function tracePanel(t) {
   const m = t.metrics || {};
   if (!m.total_s && m.total_s !== 0) return [h("p", { class: "muted" }, "Details appear when the answer is complete.")];
   const search = (m.embed_ms + m.search_ms) / 1000, rerank = (m.rerank_ms || 0) / 1000;
-  const gen = Math.max(0, m.total_s - search - rerank);
+  const verify = (m.verify_ms || 0) / 1000;
+  const gen = Math.max(0, m.total_s - search - rerank - verify);
   const total = Math.max(m.total_s, 0.001);
   const seg = (v, color) => h("div", { style: { width: `${(100 * v) / total}%`, background: color } });
   const st = t.settings || {};
@@ -430,11 +466,12 @@ export function tracePanel(t) {
   ];
   return [
     h("div", { class: "section-title" }, `Took ${num(m.total_s, 1)} s`),
-    h("div", { class: "timeline" }, seg(search, "#60a5fa"), seg(rerank, "#a78bfa"), seg(gen, "var(--accent)")),
+    h("div", { class: "timeline" }, seg(search, "#60a5fa"), seg(rerank, "#a78bfa"), seg(gen, "var(--accent)"), seg(verify, "#f59e0b")),
     h("div", { class: "legend" },
       h("span", {}, h("i", { style: { background: "#60a5fa" } }), `Search ${num(search, 2)} s`),
       h("span", {}, h("i", { style: { background: "#a78bfa" } }), m.rerank ? `Rerank ${num(rerank, 1)} s` : "No reranking"),
-      h("span", {}, h("i", { style: { background: "var(--accent)" } }), `Answer ${num(gen, 1)} s`)),
+      h("span", {}, h("i", { style: { background: "var(--accent)" } }), `Answer ${num(gen, 1)} s`),
+      m.claims_checked ? h("span", {}, h("i", { style: { background: "#f59e0b" } }), `Check ${m.claims_checked} statements ${num(verify, 1)} s`) : null),
     h("div", { class: "section-title", style: { marginTop: "18px" } }, "Details"),
     h("dl", { class: "kv" }, rows.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v ?? "—")])),
     st.llm_model ? h("div", { class: "hint", style: { marginTop: "14px" } },

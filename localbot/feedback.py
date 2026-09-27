@@ -50,7 +50,9 @@ def save_grade(iid, grade, tags=(), reason="", correction="", learn=True):
     if grade not in GRADES and grade is not None:
         raise ValueError("Grade must be good, partial or bad")
     tags = [t for t in (tags or []) if t in TAG_KEYS]
-    storage.query("UPDATE interactions SET grade = ?, tags = ?, reason = ?, correction = ?, graded_at = ? WHERE id = ?",
+    # Grading by hand replaces a carried-over grade: it's now the user's own.
+    storage.query("UPDATE interactions SET grade = ?, tags = ?, reason = ?, correction = ?, graded_at = ?, "
+                  "grade_source = NULL WHERE id = ?",
                   (grade, json.dumps(tags), (reason or "").strip(), (correction or "").strip(),
                    storage.now() if grade else None, iid))
     row.update(grade=grade, correction=(correction or "").strip())
@@ -80,6 +82,8 @@ def list_interactions(status="all", source="all", search="", run_id=None, flagge
         params.append(status)
     elif status == "graded":
         where.append("grade IS NOT NULL")
+    elif status == "carried":
+        where.append("grade_source LIKE 'carried:%'")
     if source == "chat":
         where.append("origin = 'chat'")
     elif source == "experiment":
@@ -95,7 +99,7 @@ def list_interactions(status="all", source="all", search="", run_id=None, flagge
         params += [f"%{search}%"] * 2
     if flagged:
         where.append("checks LIKE '%\"kind\"%'")
-    sql = ("SELECT id, ts, origin, run_id, qid, conversation_id, question, answer, grade, tags, metrics, checks "
+    sql = ("SELECT id, ts, origin, run_id, qid, conversation_id, question, answer, grade, tags, metrics, checks, grade_source "
            "FROM interactions" + (" WHERE " + " AND ".join(where) if where else "")
            + " ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?")
     rows = storage.query(sql, params + [limit, offset])
@@ -109,6 +113,7 @@ def list_interactions(status="all", source="all", search="", run_id=None, flagge
             "id": r["id"], "ts": r["ts"], "origin": r["origin"], "run_id": r["run_id"], "qid": r["qid"],
             "conversation_id": r["conversation_id"], "question": _preview(r["question"], 200),
             "answer": _preview(r["answer"]), "grade": r["grade"], "tags": json.loads(r["tags"] or "[]"),
+            "carried": bool(r["grade_source"]),
             "confidence": m.get("confidence"), "warnings": len(checks.get("warnings", [])),
             "total_s": m.get("total_s"),
         })
@@ -116,7 +121,7 @@ def list_interactions(status="all", source="all", search="", run_id=None, flagge
 
 
 def stats():
-    rows = storage.query("SELECT origin, grade, tags, metrics FROM interactions")
+    rows = storage.query("SELECT origin, grade, tags, metrics, grade_source FROM interactions")
     grades = Counter(r["grade"] for r in rows if r["grade"])
     tags = Counter(t for r in rows for t in json.loads(r["tags"] or "[]"))
     conf = {}
@@ -128,6 +133,7 @@ def stats():
         "total": len(rows), "graded": sum(grades.values()),
         "ungraded": len(rows) - sum(grades.values()),
         "grades": {g: grades.get(g, 0) for g in GRADES},
+        "carried": sum(1 for r in rows if r["grade"] and r["grade_source"]),
         "tags": dict(tags), "confidence_by_grade": conf,
         "chat": sum(1 for r in rows if r["origin"] == "chat"),
         "learned": index.memory.count(),

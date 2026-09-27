@@ -69,6 +69,14 @@ export function effectText(key, value, v, ins, models = []) {
     }
     case "history_turns":
       return value === 0 ? "Each question is answered on its own." : `The last ${value} question/answer pair${value > 1 ? "s are" : " is"} sent with each new question.`;
+    case "verify_claims":
+      return value ? `Adds ≈ ${fmtS(4 * per)} to a typical answer (about 4 statements × ${fmtS(per)}). Unsupported sentences are highlighted.`
+                   : "Faster, but wrong details inside an answer are only caught when they're numbers or identifiers.";
+    case "claim_min_score": {
+      const s = share(ins.claim_scores || [], value);
+      return s === null ? "Higher = more sentences marked as unsupported."
+        : `Of ${ins.claim_scores.length} recently checked statements, ${Math.round(100 * (1 - s))}% would be marked unsupported.`;
+    }
     case "low_confidence": {
       const c = ins.confidence_by_grade || {};
       const parts = ["good", "partial", "bad"].filter((g) => c[g]?.mean != null).map((g) => `${g} ${c[g].mean.toFixed(2)}`);

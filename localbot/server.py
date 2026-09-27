@@ -36,7 +36,9 @@ def insights():
     """Measured numbers that let the UI say what a setting will do."""
     rows = storage.query("SELECT metrics, hits, settings FROM interactions WHERE origin IN ('chat', 'experiment') "
                          "ORDER BY ts DESC LIMIT 300")
-    rerank_scores, dense_scores, per_candidate, tps = [], [], [], []
+    rerank_scores, dense_scores, per_candidate, tps, claim_scores = [], [], [], [], []
+    for r in storage.query("SELECT checks FROM interactions ORDER BY ts DESC LIMIT 300"):
+        claim_scores += [c["score"] for c in json.loads(r["checks"] or "{}").get("claims", [])]
     for r in rows:
         m, hits, st = json.loads(r["metrics"] or "{}"), json.loads(r["hits"] or "[]"), json.loads(r["settings"] or "{}")
         rerank_scores += [h["rerank"] for h in hits if "rerank" in h]
@@ -58,6 +60,7 @@ def insights():
         "tok_per_s": round(statistics.median(tps), 1) if tps else None,
         "rerank_scores": [round(x, 3) for x in rerank_scores[:800]],
         "dense_scores": [round(x, 3) for x in dense_scores[:800]],
+        "claim_scores": claim_scores[:800],
         "confidence_by_grade": feedback.stats()["confidence_by_grade"],
         "gpu": models.gpu(), "model_sizes": sizes,
     }
@@ -201,8 +204,13 @@ def interaction(iid: str):
         item = next((q for q in (qs or {}).get("items", []) if q["id"] == row["qid"]), None)
         if item:
             expected = {k: item.get(k) for k in ("variant", "answerable", "facts", "note")}
+    carried_from = None
+    if (row.get("grade_source") or "").startswith("carried:"):
+        src = storage.query("SELECT i.id, i.ts, i.origin, r.name AS run_name FROM interactions i "
+                            "LEFT JOIN runs r ON r.id = i.run_id WHERE i.id = ?", (row["grade_source"][8:],))
+        carried_from = src[0] if src else {"id": row["grade_source"][8:]}
     return {**row, "run_name": run[0]["name"] if run else None, "expected": expected,
-            "conversation_title": conv["title"] if conv else None}
+            "carried_from": carried_from, "conversation_title": conv["title"] if conv else None}
 
 
 class GradeBody(BaseModel):

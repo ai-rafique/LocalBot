@@ -47,7 +47,7 @@ def _print_summary(run):
     s = run["summary"]
     print(f"\n{run['name']}  [{run['status']}]  {run['total']} questions")
     for key in ("good_rate", "auto_correct", "fact_coverage", "context_recall", "refusal_accuracy", "offtopic_blocked",
-                "false_refusals", "generation_misses", "flagged", "latency_s", "graded"):
+                "false_refusals", "generation_misses", "flagged", "claims_flagged", "latency_s", "graded"):
         if s.get(key) is not None:
             v = s[key]
             print(f"  {key:<18} {v:.3f}" if isinstance(v, float) else f"  {key:<18} {v}")

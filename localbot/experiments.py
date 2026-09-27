@@ -240,6 +240,7 @@ def _execute(rid):
                                   (rid, q["id"], iid, json.dumps(result)))
                     storage.query("UPDATE runs SET done = ? WHERE id = ?", (n, rid))
         storage.query("UPDATE runs SET status = 'done', finished = ? WHERE id = ?", (storage.now(), rid))
+        carry_over_grades(rid)
     except Exception as e:
         traceback.print_exc()
         storage.query("UPDATE runs SET status = 'failed', error = ?, finished = ? WHERE id = ?",
@@ -267,8 +268,30 @@ def _run_question(rid, q, cfg):
     return iid, {**base, "coverage": cov, "context_coverage": fact_coverage(sent_text, q["facts"]),
                  "refused": bool(REFUSAL_RE.search(row["answer"])), "auto_label": auto_label(q, row["answer"], cov),
                  "passages_sent": m["passages_used"], "top_score": m["top_score"], "confidence": m["confidence"],
-                 "unsupported_terms": m["unsupported_terms"], "answer_tokens": m["answer_tokens"],
+                 "unsupported_terms": m["unsupported_terms"], "claims_unsupported": m.get("claims_unsupported"),
+                 "answer_tokens": m["answer_tokens"],
                  "total_s": m["total_s"]}
+
+
+def carry_over_grades(rid):
+    """Give each ungraded answer of a run the grade of an identical answer
+    to the same question that the user graded by hand. Only word-for-word
+    identical answers qualify: a one-word change can make an answer wrong.
+    Never copies from carried grades, so nothing is copied twice removed.
+    Corrections aren't copied (they teach the chat). Returns the count."""
+    rows = storage.query("SELECT i.id, i.question, i.answer FROM run_results rr JOIN interactions i "
+                         "ON i.id = rr.interaction_id WHERE rr.run_id = ? AND i.grade IS NULL", (rid,))
+    n = 0
+    for r in rows:
+        src = storage.query("SELECT id, grade, tags, reason FROM interactions WHERE question = ? AND answer = ? "
+                            "AND grade IS NOT NULL AND grade_source IS NULL AND id != ? ORDER BY graded_at DESC LIMIT 1",
+                            (r["question"], r["answer"], r["id"]))
+        if src:
+            s = src[0]
+            storage.query("UPDATE interactions SET grade = ?, tags = ?, reason = ?, graded_at = ?, grade_source = ? "
+                          "WHERE id = ?", (s["grade"], s["tags"], s["reason"], storage.now(), f"carried:{s['id']}", r["id"]))
+            n += 1
+    return n
 
 
 def _worker():
@@ -283,6 +306,9 @@ def _worker():
 def start_worker():
     # Runs left "running" by a previous process can't be resumed.
     storage.query("UPDATE runs SET status = 'interrupted' WHERE status = 'running'")
+    # Grades given since a run finished can pre-grade its identical answers.
+    for r in storage.query("SELECT id FROM runs WHERE status IN ('done', 'interrupted', 'cancelled')"):
+        carry_over_grades(r["id"])
     for r in storage.query("SELECT id FROM runs WHERE status = 'queued' ORDER BY created"):
         _queue.put(r["id"])
     threading.Thread(target=_worker, daemon=True, name="experiments").start()
@@ -316,10 +342,11 @@ def get_run(rid):
 
 
 def _results(rid):
-    rows = storage.query("SELECT rr.qid, rr.interaction_id, rr.result, i.grade, i.tags FROM run_results rr "
+    rows = storage.query("SELECT rr.qid, rr.interaction_id, rr.result, i.grade, i.tags, i.grade_source FROM run_results rr "
                          "LEFT JOIN interactions i ON i.id = rr.interaction_id WHERE rr.run_id = ?", (rid,))
     return [{"qid": r["qid"], "interaction_id": r["interaction_id"], "grade": r["grade"],
-             "tags": json.loads(r["tags"] or "[]"), **json.loads(r["result"])} for r in rows]
+             "carried": bool(r["grade_source"]), "tags": json.loads(r["tags"] or "[]"),
+             **json.loads(r["result"])} for r in rows]
 
 
 def summarize(rid, brief=False):
@@ -337,6 +364,7 @@ def summarize(rid, brief=False):
         "offtopic_blocked": _mean([1.0 if not r.get("passages_sent") else 0.0 for r in unans]),
         "latency_s": _mean([r.get("total_s") for r in res]),
         "graded": len(graded),
+        "carried": sum(1 for r in graded if r.get("carried")),
         "good_rate": _mean([1.0 if r["grade"] == "good" else 0.0 for r in graded]),
     }
     if not retrieval_only:
@@ -348,6 +376,9 @@ def summarize(rid, brief=False):
             # The facts were in the passages, but not in the answer: the model misread.
             "generation_misses": sum(1 for r in ans if r.get("context_coverage") == 1 and (r.get("coverage") or 0) < 1),
             "flagged": sum(1 for r in res if r.get("unsupported_terms")),
+            # None for runs made before the claim check existed.
+            "claims_flagged": (sum(1 for r in res if r.get("claims_unsupported"))
+                               if any(r.get("claims_unsupported") is not None for r in res) else None),
             "confidence": _mean([r.get("confidence") for r in res]),
         })
     if brief:

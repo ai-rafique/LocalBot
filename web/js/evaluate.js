@@ -1,6 +1,6 @@
 // Evaluate: a grading console for every logged answer (chat and experiments).
 import { api } from "./api.js";
-import { sourcesPanel, tracePanel } from "./chat.js";
+import { checksPanel, claimMarks, sourcesPanel, tracePanel } from "./chat.js";
 import { renderMarkdown } from "./markdown.js";
 import { app, menuButton } from "./main.js";
 import { dialog, fill, gradeBadge, h, icon, num, pct, segmented, switchEl, timeAgo, toast, toastError } from "./ui.js";
@@ -32,7 +32,7 @@ export async function render(main, route) {
     runSelect.replaceChildren(h("option", { value: "" }, "All runs"), ...runs.map((r) => h("option", { value: r.id, selected: r.id === f.run }, r.name)));
     fill(toolbar,
       segmented([{ value: "ungraded", label: "To grade" }, { value: "all", label: "All" }, { value: "good", label: "Good" },
-        { value: "partial", label: "Partial" }, { value: "bad", label: "Bad" }], f.status, (v) => { f.status = v; loadList(); }),
+        { value: "partial", label: "Partial" }, { value: "bad", label: "Bad" }, { value: "carried", label: "Carried over" }], f.status, (v) => { f.status = v; loadList(); }),
       h("select", { onchange: (e) => { f.source = e.target.value; loadList(); } },
         [["all", "Chat and experiments"], ["chat", "Chat only"], ["experiment", "Experiments only"]].map(([v, l]) => h("option", { value: v, selected: f.source === v }, l))),
       runs.length ? runSelect : null,
@@ -52,7 +52,8 @@ export async function render(main, route) {
     tags = stats.tag_vocabulary;
     const g = stats.grades, n = Math.max(1, stats.graded);
     fill(statsEl,
-      h("div", { class: "item" }, h("b", {}, `${stats.graded} / ${stats.total}`), h("span", {}, "graded")),
+      h("div", { class: "item" }, h("b", {}, `${stats.graded} / ${stats.total}`),
+        h("span", {}, stats.carried ? `graded · ${stats.carried} carried over` : "graded")),
       h("div", { class: "item" },
         h("div", { class: "gradebar", title: `good ${g.good} · partial ${g.partial} · bad ${g.bad}` },
           h("div", { class: "g", style: { width: `${(100 * g.good) / n}%` } }), h("div", { class: "p", style: { width: `${(100 * g.partial) / n}%` } }),
@@ -89,12 +90,13 @@ export async function render(main, route) {
       h("div", { class: "hint", style: { padding: "8px 14px", borderBottom: "1px solid var(--border)" } }, `${total} answer${total === 1 ? "" : "s"}`),
       ...items.map((x) => h("div", { class: "eval-item" + (x.id === selected ? " active" : ""), role: "option", "aria-selected": x.id === selected ? "true" : "false",
         "data-id": x.id, onclick: () => select(x.id) },
-        h("span", { class: `grade-dot ${x.grade || ""}`, title: x.grade || "not graded" }),
+        h("span", { class: `grade-dot ${x.grade || ""}`, title: x.grade ? (x.carried ? `${x.grade} (carried over)` : x.grade) : "not graded" }),
         h("div", { style: { minWidth: 0, flex: 1 } },
           h("div", { class: "q" }, x.question),
           h("div", { class: "meta" },
             h("span", {}, x.origin === "chat" ? "Chat" : x.qid ? `Experiment · ${x.qid}` : "Experiment"),
             h("span", {}, timeAgo(x.ts)),
+            x.carried ? h("span", { title: "Grade carried over from an identical answer you graded" }, "↺ carried") : null,
             x.warnings ? h("span", { style: { color: "var(--warn)" }, title: "Has warnings" }, `⚠ ${x.warnings}`) : null,
             x.confidence != null ? h("span", {}, `conf ${num(x.confidence)}`) : null)))));
   }
@@ -124,7 +126,7 @@ export async function render(main, route) {
     const source = d.origin === "chat"
       ? h("span", {}, "Chat", d.conversation_id ? [" · ", h("a", { href: `#/chat/${d.conversation_id}` }, d.conversation_title || "open conversation")] : null)
       : h("span", {}, "Experiment", d.run_id ? [" · ", h("a", { href: `#/experiments/run/${d.run_id}` }, d.run_name || "run")] : null, d.qid ? ` · ${d.qid}` : "");
-    const answer = h("div", { class: "md", html: renderMarkdown(d.answer, used.length) });
+    const answer = h("div", { class: "md", html: renderMarkdown(d.answer, used.length, claimMarks(d)) });
     const sourcesBody = h("div", { class: "fold-body" });
     answer.addEventListener("click", (e) => {
       const c = e.target.closest(".cite");
@@ -152,7 +154,10 @@ export async function render(main, route) {
         [m.total_s != null ? `${num(m.total_s, 1)} s` : null, m.confidence != null ? `confidence ${num(m.confidence)}` : null,
          `${used.length} passages sent`, d.settings?.llm_model || d.settings?.llm].filter(Boolean).join(" · ")),
       expected, sourcesFold,
-      h("details", { class: "fold" }, h("summary", {}, "Trace"), h("div", { class: "fold-body" }, ...tracePanel(d))),
+      d.checks?.claims ? h("details", { class: "fold", open: d.checks.claims.some((c) => !c.supported) },
+        h("summary", {}, `Statement check (${d.checks.claims.filter((c) => c.supported).length} of ${d.checks.claims.length} supported)`),
+        h("div", { class: "fold-body" }, checksPanel(d))) : null,
+      h("details", { class: "fold" }, h("summary", {}, "Trace"), h("div", { class: "fold-body" }, tracePanel(d))),
       h("details", { class: "fold" }, h("summary", {}, "Exact prompt"), h("div", { class: "fold-body" },
         ...(d.messages || []).flatMap((msg) => [h("div", { class: "role-tag" }, msg.role), h("pre", { class: "prompt" }, msg.content)]))));
     fill(detailEl, scroll, grader());
@@ -176,7 +181,10 @@ export async function render(main, route) {
       buttons, tagRow, reasonEl,
       h("details", { open: hasCorrection }, h("summary", { class: "hint", style: { cursor: "pointer" } }, "Correct answer"), h("div", { style: { marginTop: "6px" } }, correctionEl)),
       h("div", { class: "grader-foot" },
-        h("span", { class: "grow" }, detail.graded_at ? `Graded ${timeAgo(detail.graded_at)}` : "Not graded yet"),
+        h("span", { class: "grow" }, detail.carried_from
+          ? ["↺ Carried over from an identical answer", detail.carried_from.run_name ? ` in “${detail.carried_from.run_name}”` : "",
+             ". Saving makes it your own grade."]
+          : detail.graded_at ? `Graded ${timeAgo(detail.graded_at)}` : "Not graded yet"),
         detail.grade ? h("button", { class: "btn ghost sm", onclick: () => save(null, true) }, "Clear grade") : null,
         h("button", { class: "btn", onclick: () => move(1, true) }, "Skip"),
         h("button", { class: "btn primary", onclick: () => save(grade) }, "Save and next", h("span", { class: "kbd", style: { background: "transparent", color: "inherit", borderColor: "currentColor" } }, "Ctrl ↵"))));
