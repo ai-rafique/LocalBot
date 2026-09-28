@@ -27,7 +27,8 @@ WEB_DIR = os.path.join(BASE_DIR, "web")
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("LOCALBOT_PORT", 64000))
 
-SUPPORTED_TYPES = [".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp"]
+SUPPORTED_TYPES = [".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".rst", ".html", ".htm", ".js", ".mjs", ".ts",
+                   ".png", ".jpg", ".jpeg", ".webp", ".zip"]
 EMBED_BATCH = 32        # chunks per Ollama embed call
 RRF_K = 60              # standard reciprocal-rank-fusion constant
 CHARS_PER_TOKEN = 3.0   # conservative estimate used to keep prompts inside the context window
@@ -82,6 +83,16 @@ SCHEMA = [
        "How many passages are sent to the model with each question.",
        "More gives more context but more neighbouring text to confuse; fewer is more focused.",
        min=1, max=10, step=1),
+    _s("rewrite_queries", "retrieval", "Rewrite follow-ups for search", "bool", True,
+       "In a conversation, the model turns a follow-up into a complete search query first: "
+       "\"and the second one?\" becomes a full question. The first question of a chat is searched "
+       "exactly as typed. The answer is still written to your own words.",
+       "Makes follow-ups find the right passages; adds about half a second to them."),
+    _s("split_comparisons", "retrieval", "Search each side of a comparison", "bool", True,
+       "For questions that compare things (\"compare Bellman-Ford with Dijkstra\", \"A vs B\"), "
+       "each thing is also searched on its own, and passages for every side are sent.",
+       "Comparisons get material on both sides instead of only the better-matching one; "
+       "adds 1-2 seconds to comparison questions only."),
     _s("hybrid", "retrieval", "Keyword + meaning search", "bool", True,
        "Combine keyword search (exact identifiers, numbers, names) with meaning-based search.",
        "Helps technical documents a lot; costs a few milliseconds."),
@@ -121,6 +132,11 @@ SCHEMA = [
     _s("history_turns", "answering", "Conversation memory", "int", 4,
        "How many earlier question/answer pairs are sent along with a new question.",
        "Search still uses only the new question.", min=0, max=10, step=1, unit="exchanges"),
+    _s("focus_history", "answering", "Only related earlier messages", "bool", True,
+       "Of the earlier exchanges, send only those about the same subject as the new question "
+       "(sharing a distinctive word such as a name), plus the previous one when the new message "
+       "is a vague follow-up.",
+       "Stops an earlier topic leaking into a new answer (e.g. BFS showing up in a Dijkstra answer)."),
     _s("verify_claims", "answering", "Check each statement", "bool", True,
        "After answering, the model checks every sentence against the passage it cites and marks "
        "sentences the passages don't support.",
@@ -153,11 +169,13 @@ SCHEMA = [
        "How long Ollama keeps models in memory after the last request.",
        "Longer avoids a slow first answer after a pause.", choices=["5m", "30m", "2h", "-1"], advanced=True),
     # --- Chunking
-    _s("read_images", "chunking", "Read pictures", "bool", True,
-       "Pictures in PDF, Word and PowerPoint files, and image files, are transcribed by the chat "
-       "model when a document is added, so their text becomes searchable.",
-       "Adds a second or two per picture when adding documents (remembered afterwards). "
-       "Text in screenshots reads well; diagrams and photos only get a short description.",
+    # Off by default: with qwen3.5:2b as reader, transcripts of the user's
+    # pictures were too often wrong to trust. Turn on to try a better reader.
+    _s("read_images", "chunking", "Read pictures (experimental)", "bool", False,
+       "Pictures in PDF, Word and PowerPoint files, and image files, are transcribed by the picture "
+       "reader model when a document is added, so their text becomes searchable. Off: pictures are ignored.",
+       "Small models misread pictures often; check the readings under a document's Pictures before "
+       "trusting them. Adds a few seconds per picture when adding documents.",
        reindex=True),
     _s("chunk_size", "chunking", "Chunk size", "int", 800,
        "Target size of a passage. Paragraphs are packed up to this; a new section starts a new chunk.",

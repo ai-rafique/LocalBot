@@ -2,11 +2,17 @@
 
 Pure functions: no model or database access.
 """
+import logging
 import os
 import re
+from html.parser import HTMLParser
 
 import docx
 from pypdf import PdfReader
+
+# pdfminer (under pdfplumber) warns about harmless PDF quirks, e.g. "Could not
+# get FontBBox from font descriptor"; the text is still read correctly.
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # Documents are read as paragraphs that keep their page and whether they are
 # a heading, so chunks can follow the document's own structure and cite pages.
@@ -296,6 +302,238 @@ def _xlsx_paragraphs(path):
         wb.close()
     return paras
 
+# --- HTML ------------------------------------------------------------------------
+HTML_TYPES = (".html", ".htm", ".xhtml")
+CODE_TYPES = (".js", ".mjs", ".cjs", ".ts")
+TEXT_TYPES = (".txt", ".md", ".markdown", ".rst")
+
+
+class _HTMLText(HTMLParser):
+    """Collects a page's readable content as paragraphs: headings, text,
+    list items, tables (row by row) and code blocks (line breaks kept).
+    Navigation, headers, footers, scripts, forms and Sphinx's ¶ links are
+    dropped; if the page marks its main content (<main>, role="main",
+    itemprop="articleBody"), only that is read."""
+
+    SKIP = {"script", "style", "noscript", "nav", "header", "footer", "aside", "form", "button",
+            "svg", "template", "select", "iframe", "canvas", "object", "head"}
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
+            "track", "wbr", "param"}
+    BLOCK = {"p", "div", "section", "article", "li", "dt", "dd", "blockquote", "figcaption", "caption",
+             "main", "body", "ul", "ol", "dl", "figure", "details", "summary", "address"}
+    SKIP_CLASS = re.compile(r"(^|[\s_-])(headerlink|sidebar|sphinxsidebar|navbar|breadcrumbs?|toctree-wrapper|"
+                            r"rst-versions|wy-nav-side|related|searchbox|footer|skip-link)($|[\s_-])", re.I)
+    SKIP_ROLE = {"navigation", "search", "banner", "contentinfo", "complementary"}
+
+    def __init__(self, has_main):
+        super().__init__(convert_charrefs=True)
+        self.has_main = has_main
+        self.stack = []  # (tag, skips, is_main)
+        self.skip = self.main = self.pre = 0
+        self.buf, self.paras = [], []
+        self.heading = 0
+        self.rows, self.cells, self.cell = None, None, None
+
+    def _collecting(self):
+        return not self.skip and (self.main or not self.has_main)
+
+    def _flush(self):
+        text = "".join(self.buf)
+        self.buf = []
+        if self.pre:
+            return
+        text = " ".join(text.split())
+        if text and self._collecting():
+            self.paras.append(_para(text, level=self.heading))
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        skips = (tag in self.SKIP or (a.get("role") or "").lower() in self.SKIP_ROLE
+                 or bool(self.SKIP_CLASS.search(a.get("class") or "")) or "hidden" in a)
+        is_main = tag == "main" or (a.get("role") or "").lower() == "main" or a.get("itemprop") == "articleBody"
+        if tag in self.VOID:
+            if tag == "br":
+                self.buf.append("\n" if self.pre else " ")
+            return
+        if self.cell is not None and tag in ("td", "th", "tr"):
+            self._end_cell()
+        if tag in self.BLOCK or tag in ("pre", "table", "tr") or re.fullmatch(r"h[1-6]", tag):
+            if self.cell is None:
+                self._flush()
+        if re.fullmatch(r"h[1-6]", tag) and self.cell is None:
+            self.heading = int(tag[1])
+        if tag == "pre":
+            self.pre += 1
+        if tag == "table" and self.rows is None and not self.pre:
+            self.rows = []
+        if tag == "tr" and self.rows is not None:
+            self.cells = []
+        if tag in ("td", "th") and self.cells is not None:
+            self.cell = []
+        self.skip += skips
+        self.main += is_main
+        self.stack.append((tag, skips, is_main))
+
+    def _end_cell(self):
+        text = " ".join("".join(self.cell).split())
+        self.cells.append(text)
+        self.cell = None
+
+    def handle_endtag(self, tag):
+        if tag in self.VOID or not any(t == tag for t, _, _ in self.stack):
+            return
+        while self.stack:
+            t, skips, is_main = self.stack.pop()
+            self._close(t)
+            self.skip -= skips
+            self.main -= is_main
+            if t == tag:
+                break
+
+    def _close(self, tag):
+        if tag in ("td", "th") and self.cell is not None:
+            self._end_cell()
+        elif tag == "tr" and self.cells is not None:
+            if any(self.cells) and self._collecting():
+                self.rows.append(" | ".join(self.cells))
+            self.cells = None
+        elif tag == "table" and self.rows is not None:
+            if self.rows:
+                self.paras.append({**_para("\n".join(self.rows)), "table": True})
+            self.rows = None
+        elif tag == "pre":
+            code = "".join(self.buf).strip("\n")
+            self.buf = []
+            self.pre -= 1
+            if code.strip() and self._collecting():
+                self.paras.append(_para(f"```\n{code}\n```"))  # a code block is never split mid-way
+        elif re.fullmatch(r"h[1-6]", tag):
+            self._flush()
+            self.heading = 0
+        elif tag in self.BLOCK:
+            if self.cell is None:
+                self._flush()
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        if self.cell is not None:
+            self.cell.append(data)
+        else:
+            self.buf.append(data)
+
+
+MAIN_RE = re.compile(r"<main[\s>]|role=[\"']main[\"']|itemprop=[\"']articleBody[\"']", re.I)
+
+
+def _html_paragraphs(html):
+    parser = _HTMLText(has_main=bool(MAIN_RE.search(html)))
+    parser.feed(html)
+    parser.close()
+    parser._flush()
+    return parser.paras
+
+
+# --- Code (JavaScript / TypeScript) ------------------------------------------------
+CODE_DECL_RE = re.compile(
+    r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?\s+(\w+)|class\s+(\w+))"
+    r"|^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:function|\([^)]*\)\s*=>|\w+\s*=>)")
+
+
+def looks_minified(text):
+    """Bundled/minified or generated files: very long lines."""
+    lines = text.splitlines() or [""]
+    return len(text) / len(lines) > 250 or max(len(l) for l in lines) > 3000
+
+
+def _code_paragraphs(text):
+    """Blocks separated by blank lines, line breaks kept; top-level
+    functions and classes become sections, so passages cite them."""
+    paras, block = [], []
+
+    def flush():
+        if block and "".join(block).strip():
+            paras.append(_para("\n".join(block).strip("\n")))
+        block.clear()
+
+    for line in text.splitlines():
+        m = CODE_DECL_RE.match(line)
+        if m:
+            flush()
+            paras.append(_para(next(g for g in m.groups() if g), level=1))
+        if not line.strip():
+            flush()
+        else:
+            block.append(line.rstrip())
+    flush()
+    return paras
+
+
+def _decode(data):
+    for enc in ("utf-8-sig", "utf-16"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return data.decode("latin-1", errors="replace")
+
+
+def paragraphs_from_bytes(name, data):
+    """Like load_paragraphs, for a file's bytes (e.g. inside a ZIP)."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in HTML_TYPES:
+        return _html_paragraphs(_decode(data))
+    if ext in CODE_TYPES:
+        return _code_paragraphs(_decode(data))
+    if ext in TEXT_TYPES:
+        return _check_heading_numbers(_markdown_paragraphs(_decode(data)))
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "file" + ext)
+        with open(path, "wb") as f:
+            f.write(data)
+        return load_paragraphs(path)
+
+
+# --- ZIP archives ------------------------------------------------------------------------
+# Folders and files that documentation sites and repositories carry but that
+# aren't content: Sphinx's page sources and static assets (duplicates and
+# theme code), search indexes, dependency folders, macOS metadata.
+ZIP_SKIP_DIRS = {"_static", "_sources", "_images", "_downloads", "_build", "__macosx", "node_modules",
+                 "vendor", "bower_components", "dist", "build", "__pycache__"}
+ZIP_SITE_FILES = {"searchindex.js", "genindex.html", "search.html", "py-modindex.html", "404.html",
+                  "objects.inv", "documentation_options.js", "sitemap.xml"}
+ZIP_MAX_FILES = 20000                 # files read from one archive
+ZIP_MAX_BYTES = 2 * 1024 ** 3         # total unpacked size read
+ZIP_MAX_FILE_BYTES = 25 * 1024 ** 2   # per file
+
+
+def zip_plan(infos, readable):
+    """For each archive entry: None (read it) or the reason it's skipped."""
+    total, count, plan = 0, 0, []
+    for info in infos:
+        if info.is_dir():
+            continue
+        parts = [p for p in info.filename.replace("\\", "/").split("/") if p]
+        name = parts[-1].lower() if parts else ""
+        ext = os.path.splitext(name)[1]
+        if any(p.lower() in ZIP_SKIP_DIRS or p.startswith(".") for p in parts[:-1]) or name.startswith("."):
+            reason = "site or tool folder"
+        elif name in ZIP_SITE_FILES or name.endswith((".min.js", ".bundle.js", ".map")):
+            reason = "generated site file"
+        elif ext not in readable:
+            reason = "not a readable type"
+        elif info.file_size > ZIP_MAX_FILE_BYTES:
+            reason = "too large"
+        elif count >= ZIP_MAX_FILES or total + info.file_size > ZIP_MAX_BYTES:
+            reason = "archive limit reached"
+        else:
+            reason = None
+            count += 1
+            total += info.file_size
+        plan.append((info, reason))
+    return plan
+
 
 def _check_heading_numbers(paras):
     """Keep a numbered line as a heading only if it continues the document's
@@ -349,9 +587,9 @@ def load_paragraphs(file_path: str):
         with open(file_path, "rb") as f:
             return [_image(f.read())]
 
-    if ext in (".txt", ".md"):
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return _check_heading_numbers(_markdown_paragraphs(f.read()))
+    if ext in TEXT_TYPES + HTML_TYPES + CODE_TYPES:
+        with open(file_path, "rb") as f:
+            return paragraphs_from_bytes(file_path, f.read())
 
     raise ValueError(f"Unsupported file type: {ext}")
 
@@ -485,6 +723,8 @@ def chunk_header(meta):
     """Title and section line put in front of a chunk for embedding and
     keyword search, so "the baud rate" can find a chunk under "UART setup"."""
     title = os.path.splitext(meta.get("source", ""))[0].replace("_", " ")
+    if meta.get("path"):  # a file inside an archive
+        title = f"{title} › {meta['path']}"
     return f"{title} — {meta['section']}" if meta.get("section") else title
 
 
@@ -497,4 +737,5 @@ def page_range(meta):
 def passage_label(h):
     """"file.pdf, p. 4 — 3.2 Frame format": where a passage came from."""
     pages = page_range(h)
-    return h["source"] + (f", p. {pages}" if pages else "") + (f" — {h['section']}" if h.get("section") else "")
+    return (h["source"] + (f" › {h['path']}" if h.get("path") else "") + (f", p. {pages}" if pages else "")
+            + (f" — {h['section']}" if h.get("section") else ""))

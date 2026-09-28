@@ -5,7 +5,7 @@ import { app, menuButton, renameChat } from "./main.js";
 import { control, effectText, invalidateSettings, loadModels, loadSettings } from "./tuning.js";
 import { add, copyText, fill, h, icon, num, popover, segmented, switchEl, thumb, toast, toastError } from "./ui.js";
 
-const STAGES = { search: "Searching your documents", rerank: "Reranking passages", write: "Writing the answer",
+const STAGES = { rewrite: "Understanding your question", search: "Searching your documents", rerank: "Reranking passages", write: "Writing the answer",
                  verify: "Checking each statement against its sources" };
 let tagVocab = null;
 
@@ -37,10 +37,22 @@ export async function render(main, route) {
   const textarea = h("textarea", { rows: 1, placeholder: "Ask about your documents…", "aria-label": "Message" });
   const sendBtn = h("button", { class: "send-btn", "aria-label": "Send", disabled: true }, icon("send"));
   const tuneBtn = h("button", { class: "tune-btn", onclick: () => quickTune(tuneBtn) }, icon("sliders"), h("span", {}, "…"));
+  // Search in: the whole library or one document (e.g. one documentation archive).
+  const readScope = () => { try { return localStorage.getItem("scope") || ""; } catch { return ""; } };
+  const scopeSelect = h("select", { class: "scope-select", "aria-label": "Search in", title: "Which documents answers are searched in",
+    onchange: () => { try { localStorage.setItem("scope", scopeSelect.value); } catch { /* private window */ } } },
+    h("option", { value: "" }, "All documents"));
+  api.get("/api/documents").then((lib) => {
+    const names = lib.documents.filter((d) => d.chunks).map((d) => d.name);
+    scopeSelect.append(...names.map((n) => h("option", { value: n }, n)));
+    scopeSelect.value = names.includes(readScope()) ? readScope() : "";
+    scopeSelect.hidden = names.length < 2;
+  }).catch(() => { scopeSelect.hidden = true; });
   const composer = h("div", { class: "composer-wrap" },
     h("div", { class: "composer" }, textarea, sendBtn),
     h("div", { class: "composer-foot" },
-      h("span", {}, "Answers come only from your documents — check the cited sources."), tuneBtn));
+      h("span", {}, "Answers come only from your documents — check the cited sources."),
+      h("label", { class: "hint", style: { display: "flex", alignItems: "center", gap: "6px" } }, "Search in", scopeSelect), tuneBtn));
 
   const chatMain = h("div", { class: "chat-main" }, topbar, thread, composer);
   const root = h("div", { class: "chat" }, chatMain, inspector);
@@ -116,9 +128,9 @@ export async function render(main, route) {
     });
     body.append(md);
     const meta = h("div", { class: "msg-meta" });
-    used.forEach((x, i) => meta.append(h("button", { class: "src-chip", title: `${x.source}${x.section ? " — " + x.section : ""}`,
+    used.forEach((x, i) => meta.append(h("button", { class: "src-chip", title: `${x.source}${x.path ? " › " + x.path : ""}${x.section ? " — " + x.section : ""}`,
       onclick: () => { state.selected = t.id; openInspector("sources", String(i + 1)); } },
-      h("span", { class: "n" }, i + 1), h("span", { class: "t" }, shortName(x.source) + pages(x)))));
+      h("span", { class: "n" }, i + 1), h("span", { class: "t" }, shortName(x.path ? x.path.split("/").pop() : x.source) + pages(x)))));
     (t.memory || []).forEach((m, i) => meta.append(h("button", { class: "src-chip", title: "Your verified answer to: " + m.question,
       onclick: () => { state.selected = t.id; openInspector("sources", `V${i + 1}`); } },
       h("span", { class: "n" }, `V${i + 1}`), h("span", { class: "t" }, "Verified answer"))));
@@ -282,13 +294,14 @@ export async function render(main, route) {
       });
     };
     try {
-      await stream("/api/chat", { message, conversation_id: state.conv?.id || null }, (ev) => {
+      await stream("/api/chat", { message, conversation_id: state.conv?.id || null, sources: scopeSelect.value ? [scopeSelect.value] : null }, (ev) => {
         if (ev.type === "conversation" && !state.conv) {
           state.conv = ev.conversation;
           history.replaceState(null, "", `#/chat/${ev.conversation.id}`);
           renderTitle(); app.refreshHistory();
         } else if (ev.type === "stage") {
-          stageEl.lastChild.textContent = ev.stage === "search" && ev.rerank ? "Searching and reranking passages" : STAGES[ev.stage] || ev.stage;
+          stageEl.lastChild.textContent = ev.stage === "search" && ev.query ? `Searching for “${ev.query}”`
+            : ev.stage === "search" && ev.rerank ? "Searching and reranking passages" : STAGES[ev.stage] || ev.stage;
           stageEl.classList.remove("hidden");
           if (ev.stage === "verify") { mdEl.classList.remove("caret"); bot.querySelector(".body").append(stageEl); }
         } else if (ev.type === "sources") {
@@ -431,15 +444,18 @@ export function sourcesPanel(t) {
     const where = [x.page_start ? `p. ${x.page_start === x.page_end ? x.page_start : `${x.page_start}–${x.page_end}`}` : null, x.section].filter(Boolean).join(" · ");
     out.push(h("div", { class: "src-card" + (used ? "" : " off"), "data-n": label || "" },
       h("div", { class: "src-head" },
-        used ? h("span", { class: "badge accent" }, label) : h("span", { class: "badge", title: "Below the relevance cutoff, so not sent to the model" }, "not sent"),
+        used ? h("span", { class: "badge accent" }, label) : h("span", { class: "badge", title: x.cut ? "Relevant, but the comparison already had its share of passages for this side" : "Below the relevance cutoff, so not sent to the model" }, "not sent"),
         h("span", { class: "name", title: x.source }, x.source)),
+      x.path ? h("div", { class: "src-where src-path", title: x.path }, x.path) : null,
       where ? h("div", { class: "src-where", title: where }, where) : null,
       (x.images || []).length ? h("div", { class: "src-thumbs" }, x.images.map(thumb),
-        h("span", { class: "hint" }, "Text read from this picture — check it against the original.")) : null,
+        h("span", { class: "hint" }, "Text read from this picture. ",
+          h("a", { href: `#/documents?doc=${encodeURIComponent(x.source)}&picture=${x.images[0]}` }, "Check or correct this reading"))) : null,
       h("div", { class: "score-bar" }, h("div", { style: { width: `${Math.max(2, Math.min(100, (x.score ?? 0) * 100))}%` } })),
       h("div", { class: "src-scores" },
         h("span", {}, `${kind} ${num(x.score)}`),
         found ? h("span", {}, `found by ${found}`) : null,
+        x.found_for ? h("span", {}, `for ${x.found_for.join(", ")}`) : null,
         x.dense != null && kind === "relevance" ? h("span", {}, `similarity ${num(x.dense)}`) : null),
       h("details", {}, h("summary", { class: "hint", style: { cursor: "pointer", marginTop: "6px" } }, "Show passage"),
         h("div", { class: "src-text" }, x.text))));
@@ -457,10 +473,12 @@ export function tracePanel(t) {
   const seg = (v, color) => h("div", { style: { width: `${(100 * v) / total}%`, background: color } });
   const st = t.settings || {};
   const rows = [
+    ["Searched for", m.search_query ? `“${m.search_query}”` : "the question as asked"],
+    m.compared ? ["Compared, each searched too", m.compared.join(" · ")] : null,
     ["Passages sent", `${m.passages_used}${m.passages_trimmed ? ` (${m.passages_trimmed} trimmed to fit)` : ""}`],
     ["Relevance cutoff", num(m.min_score)], ["Best passage score", num(m.top_score)],
     ["Gap to 2nd", num(m.score_gap)], ["Verified answers used", m.memory_used],
-    ["Earlier turns sent", m.history_msgs ? m.history_msgs / 2 : 0],
+    ["Earlier turns sent", (m.history_msgs ? m.history_msgs / 2 : 0) + (m.history_dropped ? ` (${m.history_dropped} on other subjects left out)` : "")],
     ["Prompt tokens", m.prompt_tokens], ["Answer tokens", `${m.answer_tokens}${m.hit_length_cap ? " (hit the limit)" : ""}`],
     ["Speed", m.tok_per_s ? `${m.tok_per_s} tokens/s` : "—"], ["First token after", `${num(m.ttft_s, 1)} s`],
     ["Confidence", m.confidence != null ? `${num(m.confidence)} (least sure token ${num(m.min_token_p)})` : "—"],
@@ -475,7 +493,7 @@ export function tracePanel(t) {
       h("span", {}, h("i", { style: { background: "var(--accent)" } }), `Answer ${num(gen, 1)} s`),
       m.claims_checked ? h("span", {}, h("i", { style: { background: "#f59e0b" } }), `Check ${m.claims_checked} statements ${num(verify, 1)} s`) : null),
     h("div", { class: "section-title", style: { marginTop: "18px" } }, "Details"),
-    h("dl", { class: "kv" }, rows.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v ?? "—")])),
+    h("dl", { class: "kv" }, rows.filter(Boolean).flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v ?? "—")])),
     st.llm_model ? h("div", { class: "hint", style: { marginTop: "14px" } },
       `${st.llm_model} · ${st.top_k} passages · ${st.rerank ? "reranked" : "not reranked"} · ${st.hybrid ? "keyword + meaning" : "meaning only"} · temperature ${st.temperature}`) : null,
   ];

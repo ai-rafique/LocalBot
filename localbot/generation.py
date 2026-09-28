@@ -10,7 +10,7 @@ import time
 
 import ollama
 
-from . import documents, retrieval, storage
+from . import documents, index, retrieval, storage
 from .config import CHARS_PER_TOKEN, NO_CONTEXT_ANSWER, S
 
 REFUSAL_RE = re.compile(
@@ -66,6 +66,115 @@ def check_claims(answer, hits, memory_items=()):
         c["score"] = round(retrieval.yes_probability(CLAIM_SYSTEM, f"<Document>: {doc}\n<Statement>: {c['claim']}"), 3)
         c["supported"] = c["score"] >= S.claim_min_score
     return claims
+
+
+REWRITE_SYSTEM = (
+    "You turn the user's latest message into one standalone search query for finding passages "
+    "in their technical documents. Use the conversation to resolve references such as 'it', "
+    "'that one' or 'the second'. Fix obvious typos and complete fragments. Keep names, "
+    "identifiers, numbers and commands exactly as written. If the message already names what it "
+    "asks about, keep those names. Output only the query, on one line.\n\n"
+    "Example: after a conversation about the Bellman-Ford algorithm, \"how does it compare with "
+    "Dijkstra?\" becomes \"How does the Bellman-Ford algorithm compare with Dijkstra's algorithm?\""
+)
+
+
+# Words that point back into the conversation.
+REFERS_BACK_RE = re.compile(r"\b(it|its|they|them|their|this|that|these|those|former|latter|above|same|"
+                            r"first one|second one|other one|previous)\b", re.I)
+
+
+def search_query(question, history=()):
+    """What to search for: a follow-up rewritten into a standalone query
+    using the conversation, or the message itself. Only used for finding
+    passages. Standalone questions are never rewritten: measured on 32
+    questions, rewriting them lost 1-2 passages and gained none (the 2B
+    paraphrases away terms the search needed)."""
+    if not S.rewrite_queries or not history:
+        return question
+    # A message that names its own subject and doesn't point back is
+    # standalone even mid-conversation; rewriting one lost its subject
+    # ("binary tree vs hash map?" -> "...their traversal strategies?").
+    if index.distinctive_terms(question) and not REFERS_BACK_RE.search(question):
+        return question
+    convo = "\n".join(f"{m['role']}: {m['content'][:300]}" for m in list(history)[-4:])
+    user = (f"Conversation so far:\n{convo}\n\n" if convo else "") + f"Latest message: {question}"
+    try:
+        r = ollama.chat(model=S.llm_model, think=False, keep_alive=S.keep_alive,
+                        options={**retrieval.gen_options(), "num_predict": 80},
+                        messages=[{"role": "system", "content": REWRITE_SYSTEM}, {"role": "user", "content": user}])
+    except ollama.ResponseError:
+        return question
+    lines = [l.strip().strip('"').strip() for l in clean_answer(r.message.content or "").splitlines() if l.strip()]
+    q = re.sub(r"^(search query|query)\s*:\s*", "", lines[0], flags=re.I) if lines else ""
+    # A rewrite much longer than the message has wandered off, and one that
+    # drops the message's own subject has replaced it (seen: "how does a
+    # binary tree differ from a hash map?" -> "how do they differ?").
+    if not q or len(q) > 3 * len(question) + 150:
+        return question
+    return question if index.distinctive_terms(question) - set(index.keyword_tokens(q)) else q
+
+
+COMPARE_RE = re.compile(r"\b(compar\w*|differ\w*|contrast\w*|versus|vs\.?|similarit\w*|better than|"
+                        r"worse than|faster than|slower than|pros and cons|trade-?offs?)(?!\w)", re.I)
+SPLIT_SYSTEM = (
+    "List the things the question compares, one per line, each as a short name exactly as written. "
+    "Only the things themselves, not what they are compared on. Output only the names. If it "
+    "doesn't compare two or more named things, output NONE.\n\n"
+    "Example: \"How does Bellman-Ford compare with Dijkstra's algorithm for shortest paths?\" "
+    "gives:\nBellman-Ford\nDijkstra's algorithm"
+)
+
+
+def comparison_parts(query):
+    """The things a comparison question compares (["Bellman-Ford", "Dijkstra's
+    algorithm"]), or [] for any other question. Only questions with a
+    comparison word reach the model, so others cost nothing."""
+    if not S.split_comparisons or not COMPARE_RE.search(query):
+        return []
+    try:
+        r = ollama.chat(model=S.llm_model, think=False, keep_alive=S.keep_alive,
+                        options={**retrieval.gen_options(), "num_predict": 60},
+                        messages=[{"role": "system", "content": SPLIT_SYSTEM}, {"role": "user", "content": query}])
+    except ollama.ResponseError:
+        return []
+    parts = []
+    for line in clean_answer(r.message.content or "").splitlines():
+        name = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip().strip('"').rstrip(".").strip()
+        if name and name.upper() != "NONE" and len(name) <= 80 and name.lower() not in (p.lower() for p in parts):
+            parts.append(name)
+    return parts[:4] if len(parts) >= 2 else []
+
+
+def find_passages(question, query, sources=None):
+    """Search for the answer's passages; the same path for chat and experiments.
+    Returns (hits, timings, query_vector, compared parts, split ms)."""
+    t0 = time.perf_counter()
+    parts = comparison_parts(query)
+    split_ms = (time.perf_counter() - t0) * 1000
+    if parts:
+        hits, timings, q_vec = retrieval.retrieve_comparison(query, parts, keyword_text=question, sources=sources)
+    else:
+        hits, timings, q_vec = retrieval.retrieve(query, keyword_text=question, sources=sources)
+    return hits, timings, q_vec, parts, split_ms
+
+
+def relevant_turns(turns, question, query):
+    """Earlier exchanges worth sending with this question. A small model
+    mixes whatever the history contains into the answer: asked to compare
+    Bellman-Ford with Dijkstra after a BFS/DFS discussion, it compared
+    Dijkstra with BFS. So older exchanges are sent only when they share a
+    distinctive word (a name, not "algorithm") with the question or its
+    search query; the previous exchange is also kept when the new message
+    has no subject of its own ("why?", "and the second one?")."""
+    if not S.focus_history or not turns:
+        return list(turns)
+    words = index.distinctive_terms(f"{question} {query}")
+    keep = [t for t in turns if words & index.distinctive_terms(
+        f"{t['question']} {(t.get('metrics') or {}).get('search_query') or ''}")]
+    if turns[-1] not in keep and not index.distinctive_terms(question):
+        keep.append(turns[-1])
+    return keep
 
 
 def build_prompt(query, hits, memory_items=()):
@@ -202,9 +311,9 @@ def warnings(answer, hits_used, checks, metrics):
     return out
 
 
-def history_for(conversation_id):
+def history_for(conversation_id=None, turns=None):
     msgs = []
-    for turn in storage.conversation_turns(conversation_id):
+    for turn in storage.conversation_turns(conversation_id) if turns is None else turns:
         # The bare question and answer, not the passage-stuffed prompt, so
         # earlier turns don't crowd the small model's context window.
         msgs += [{"role": "user", "content": turn["question"]}, {"role": "assistant", "content": turn["answer"]}]
@@ -212,21 +321,29 @@ def history_for(conversation_id):
 
 
 def answer(question, conversation_id=None, origin="chat", run_id=None, qid=None,
-           use_memory=None, retrieval_only=False):
+           use_memory=None, retrieval_only=False, sources=None):
     """Yield events while answering; the last is {"type": "done", "interaction": id}.
 
     Events: stage (search / rerank / write), sources (passages and verified
-    answers used), token (answer text), done.
+    answers used), token (answer text), done. sources limits the search
+    to some documents.
     """
     use_memory = S.use_memory if use_memory is None else use_memory
     rerank = S.rerank
     min_score = S.cutoff()
     t_start = time.perf_counter()
-    yield {"type": "stage", "stage": "search", "rerank": rerank}
-    all_hits, timings, q_vec = retrieval.retrieve(question)
+    all_turns = storage.conversation_turns(conversation_id) if conversation_id else []
+    if S.rewrite_queries and all_turns:
+        yield {"type": "stage", "stage": "rewrite"}
+    query = search_query(question, history_for(turns=all_turns[-2:]))
+    rewrite_ms = (time.perf_counter() - t_start) * 1000
+    turns = all_turns[-S.history_turns:] if S.history_turns else []
+    kept = relevant_turns(turns, question, query)
+    history = history_for(turns=kept)
+    yield {"type": "stage", "stage": "search", "rerank": rerank, "query": query if query != question else None}
+    all_hits, timings, q_vec, parts, split_ms = find_passages(question, query, sources)
     memory_items = retrieval.recall(q_vec) if use_memory else []
-    passing = [h for h in all_hits if h["score"] >= min_score]
-    history = history_for(conversation_id) if conversation_id else []
+    passing = retrieval.sendable(all_hits)
     system_prompt = S.system_prompt
     history_sent, hits, prompt = fit_context(question, history, passing, memory_items, system_prompt)
     for h in hits:
@@ -276,11 +393,13 @@ def answer(question, conversation_id=None, origin="chat", run_id=None, qid=None,
         "score_gap": round(scores[0] - scores[1], 3) if len(scores) > 1 else None,
         "passages_used": len(hits), "passages_trimmed": len(passing) - len(hits),
         "memory_used": len(memory_items), "history_msgs": len(history_sent),
+        "history_dropped": len(turns) - len(kept), "compared": parts or None, "split_ms": round(split_ms, 1),
         **conf,
         "unsupported_terms": len(checks["unsupported"]), "bad_citations": len(checks["bad_citations"]),
         "cited": checks["cited"],
         "embed_ms": round(timings["embed_ms"], 1), "search_ms": round(timings["search_ms"], 1),
         "rerank_ms": round(timings["rerank_ms"], 1), "verify_ms": round(verify_ms, 1),
+        "search_query": query if query != question else None, "scope": sorted(sources) if sources else None, "rewrite_ms": round(rewrite_ms, 1),
         "claims_checked": len(claims), "claims_unsupported": sum(1 for c in claims if not c["supported"]),
         "ttft_s": round((first_token_at or t_end) - t_start, 2), "total_s": round(t_end - t_start, 2),
         "prompt_tokens": (final.prompt_eval_count or 0) if final else 0, "answer_tokens": eval_count,

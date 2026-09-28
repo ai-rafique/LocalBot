@@ -212,5 +212,206 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(chunks[0]["images"], ["0123456789abcdef"])
 
 
+class PictureCorrectionTests(unittest.TestCase):
+    def test_correction_overrides_and_reverts(self):
+        from localbot import vision
+        image_id = vision.store(_png("Reset: AA 01"))
+        with open(vision._cache_path(image_id), "w", encoding="utf-8") as f:
+            f.write("model reading")
+        self.assertEqual(vision.cached(image_id), "model reading")
+        vision.set_correction(image_id, "  Reset: AA 01 00 FF  ")
+        self.assertEqual((vision.cached(image_id), vision.is_corrected(image_id)), ("Reset: AA 01 00 FF", True))
+        vision.clear_correction(image_id)
+        self.assertEqual((vision.cached(image_id), vision.is_corrected(image_id)), ("model reading", False))
+
+
+PAGE = """<html><head><title>Node</title><script>var x = 1;</script></head><body>
+<nav class="sidebar"><a href="#">Classes</a></nav>
+<div role="main">
+<h1>Node<a class="headerlink" href="#node">¶</a></h1>
+<p>Base class for all <em>scene</em> objects.</p>
+<h2>Methods</h2>
+<table><tr><th>Return</th><th>Method</th></tr><tr><td>void</td><td>queue_free ( )</td></tr></table>
+<pre>func _ready():
+    queue_free()</pre>
+</div>
+<footer>Built with a theme</footer></body></html>"""
+
+SCRIPT = """import { x } from "./x.js";
+
+export function add(a, b) {
+  return a + b;
+}
+
+class Player {
+  go() {}
+}
+"""
+
+
+class ReaderTests(unittest.TestCase):
+    def test_html_keeps_content_drops_site_chrome(self):
+        paras = documents.paragraphs_from_bytes("node.html", PAGE.encode())
+        text = "\n".join(p["text"] for p in paras)
+        self.assertEqual([(p["level"], p["text"]) for p in paras[:2]], [(1, "Node"), (0, "Base class for all scene objects.")])
+        self.assertIn("void | queue_free ( )", text)
+        self.assertIn("```\nfunc _ready():\n    queue_free()\n```", text)
+        for gone in ("Classes", "¶", "var x", "Built with"):
+            self.assertNotIn(gone, text)
+
+    def test_code_sections_follow_functions_and_classes(self):
+        paras = documents.paragraphs_from_bytes("game.js", SCRIPT.encode())
+        self.assertEqual([p["text"] for p in paras if p["level"]], ["add", "Player"])
+        self.assertTrue(documents.looks_minified("var a=1;" * 500))
+        self.assertFalse(documents.looks_minified(SCRIPT))
+
+
+class ZipTests(unittest.TestCase):
+    def test_docs_site_archive(self):
+        import zipfile
+        from localbot import index
+        path = os.path.join(tempfile.mkdtemp(), "site.zip")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("site/classes/node.html", PAGE)
+            z.writestr("site/classes/copy_of_node.html", PAGE)           # same bytes: duplicate
+            z.writestr("site/game.js", SCRIPT)
+            z.writestr("site/bundle.js", "var a=1;" * 500)               # minified
+            z.writestr("site/_static/theme.js", SCRIPT + "// theme")     # site folder
+            z.writestr("site/searchindex.js", "Search.setIndex({})")     # generated
+            z.writestr("site/genindex.html", PAGE + " ")                 # generated
+            z.writestr("__MACOSX/site/._node.html", "junk")
+            z.writestr("site/logo.svg", "<svg/>")                        # not readable
+            z.writestr("site/empty.md", "   ")
+            z.writestr("site/notes/", "")
+        chunks, info = index._chunk_file(path, 800, 100)
+        self.assertEqual(info["files"], 2)
+        self.assertEqual(info["skipped"], {"duplicate": 1, "minified or generated code": 1, "site or tool folder": 2,
+                                           "generated site file": 2, "not a readable type": 1, "no readable text": 1})
+        self.assertEqual(sorted({c["path"] for c in chunks}), ["site/classes/node.html", "site/game.js"])
+        header = documents.chunk_header({"source": "site.zip", "path": "site/classes/node.html", "section": "Methods"})
+        self.assertEqual(header, "site › site/classes/node.html — Methods")
+        # A second read comes from the cache without opening the archive.
+        again, _ = index._chunk_file(path, 800, 100, cached_only=True)
+        self.assertEqual(len(again), len(chunks))
+
+
+class KeywordIndexTests(unittest.TestCase):
+    def test_postings_with_document_filter(self):
+        from localbot import index
+
+        class FakeCollection:
+            name = "fake-keyword-test"
+
+            def get(self, include):
+                return {"ids": ["a", "b", "c"], "documents": ["queue_free frees the node", "the node tree", "unrelated text"],
+                        "metadatas": [{"source": "godot.zip"}, {"source": "manual.pdf"}, {"source": "manual.pdf"}]}
+
+        index._local.collection = FakeCollection()
+        try:
+            self.assertEqual([cid for _, cid in index.keyword_search("queue_free node", 5)], ["a", "b"])
+            self.assertEqual([cid for _, cid in index.keyword_search("node", 5, sources={"manual.pdf"})], ["b"])
+        finally:
+            index._keyword_cache.pop("fake-keyword-test", None)
+            index._local.collection = None
+
+
+class JobTests(unittest.TestCase):
+    def test_jobs_run_in_order_with_progress(self):
+        import time
+        from localbot import jobs
+
+        def work(progress):
+            progress(1, 2, "half")
+            return {"ok": True}
+
+        def fail(progress):
+            raise ValueError("bad archive")
+
+        a, b = jobs.submit("add", "A", work), jobs.submit("add", "B", fail)
+        for _ in range(100):
+            if jobs.get(b)["finished"]:
+                break
+            time.sleep(0.02)
+        self.assertEqual((jobs.get(a)["status"], jobs.get(a)["result"], jobs.get(a)["step"]), ("done", {"ok": True}, "half"))
+        self.assertEqual((jobs.get(b)["status"], jobs.get(b)["error"]), ("failed", "bad archive"))
+        self.assertIsNone(jobs.active())
+
+
+class ComparisonTests(unittest.TestCase):
+    def test_comparison_words(self):
+        for q in ("Compare Bellman-Ford with Dijkstra", "BFS vs DFS", "difference between A and B",
+                  "how does A differ from B", "is A faster than B"):
+            self.assertTrue(generation.COMPARE_RE.search(q), q)
+        for q in ("Explain breadth first search", "What is the diff tool?", "list the vertices"):
+            self.assertFalse(generation.COMPARE_RE.search(q), q)
+
+    def test_follow_up_words(self):
+        for q in ("How does it compare with Dijkstra?", "what about the second one", "why are they slow"):
+            self.assertTrue(generation.REFERS_BACK_RE.search(q), q)
+        for q in ("how does a binary tree differ from a hash map?", "explain iterators", "Is BFS complete?"):
+            self.assertFalse(generation.REFERS_BACK_RE.search(q), q)
+
+    def test_every_side_gets_passages(self):
+        from localbot import retrieval
+        from localbot.config import S
+
+        def hit(i, score):
+            return {"id": i, "score": score, "text": i}
+
+        results = {  # the whole question only finds one side; below-cutoff ones aren't sent
+            "compare A with B": [hit("a1", .9), hit("a2", .8), hit("ab", .4), hit("a3", .7)],
+            "What is A?": [hit("a1", .95), hit("a4", .6)],
+            "What is B?": [hit("b1", .9), hit("ab", .85), hit("b2", .3)],
+        }
+        original = retrieval.retrieve
+        retrieval.retrieve = lambda q, **kw: (results[q], {"embed_ms": 1.0, "search_ms": 1.0, "rerank_ms": 1.0}, [0])
+        try:
+            with S.override({"top_k": 3, "rerank": True, "min_score_reranked": 0.5}):
+                hits, timings, _ = retrieval.retrieve_comparison("compare A with B", ["A", "B"])
+        finally:
+            retrieval.retrieve = original
+        self.assertEqual([h["id"] for h in hits[:4]], ["a1", "b1", "a2", "a4"])  # top_k 3 + 1 extra side
+        self.assertEqual(hits[0]["found_for"], ["the question", "A"])
+        self.assertEqual({h["id"] for h in hits[4:]}, {"ab", "a3", "b2"})  # logged, not sent
+        with S.override({"rerank": True, "min_score_reranked": 0.5}):
+            self.assertEqual([h["id"] for h in retrieval.sendable(hits)], ["a1", "b1", "a2", "a4"])
+        self.assertEqual(timings["rerank_ms"], 3.0)
+
+    def test_history_keeps_only_the_same_subject(self):
+        from localbot import index
+        from localbot.config import S
+        common = {"algorithm", "graph", "shortest", "path"}
+        original = index.distinctive_terms
+        index.distinctive_terms = lambda text: {w for w in keyword_tokens(text) if len(w) > 2 and w not in common
+                                                and w not in index.QUESTION_WORDS}
+        turns = [{"question": "Explain BFS and compare with DFS", "metrics": {}},
+                 {"question": "Explain the Bellman-Ford algorithm", "metrics": {}},
+                 {"question": "what graph is used?", "metrics": {}}]
+        try:
+            with S.override({"focus_history": True}):
+                kept = generation.relevant_turns(turns, "compare it with Dijkstra",
+                                                 "Compare the Bellman-Ford algorithm with Dijkstra's algorithm")
+                self.assertEqual(kept, [turns[1]])
+                self.assertEqual(generation.relevant_turns(turns, "why?", "why"), [turns[2]])
+            with S.override({"focus_history": False}):
+                self.assertEqual(generation.relevant_turns(turns, "why?", "why"), turns)
+        finally:
+            index.distinctive_terms = original
+
+
+class PortTests(unittest.TestCase):
+    def test_busy_port_falls_back_with_a_reason(self):
+        from localbot.server import open_listening_socket
+        first, _ = open_listening_socket(0)
+        port = first.getsockname()[1]
+        second, notes = open_listening_socket(port)
+        try:
+            self.assertNotEqual(second.getsockname()[1], port)
+            self.assertIn(str(port), notes[0])
+        finally:
+            first.close()
+            second.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,15 @@ export function effectText(key, value, v, ins, models = []) {
       const chars = value * avg;
       return `The model reads about ${Math.round(chars).toLocaleString()} characters (~${Math.round(chars / 3.5).toLocaleString()} tokens) of passages per question.`;
     }
+    case "rewrite_queries":
+      return value ? "Follow-ups (\"what about the second one?\") are turned into full search queries using the conversation; the chat shows what was searched for. Standalone questions are searched as typed (rewriting them didn't help in testing)."
+                   : "Search uses every message exactly as typed; follow-ups that rely on earlier messages may find the wrong passages.";
+    case "split_comparisons":
+      return value ? "\"Compare A with B\" searches A and B separately too, so both sides reach the model. Adds 1–2 s to comparison questions only."
+                   : "Comparisons are searched as one question; passages usually favour one side, and the model may say it doesn't know the other.";
+    case "focus_history":
+      return value ? "Earlier exchanges on other subjects are left out, so an old topic doesn't leak into a new answer. Start a new chat for a clean slate anyway."
+                   : "Every recent exchange is sent, whatever it was about; a small model may mix earlier topics into the answer.";
     case "hybrid":
       return value ? "Exact terms (ids, commands, numbers) are found even when meaning-search misses them."
                    : "Meaning-search only: identifiers and exact values are found less reliably.";

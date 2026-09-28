@@ -184,7 +184,7 @@ export async function newRunDialog({ sets, settings, setId, preset = {}, onStart
   settings = settings || await loadSettings();
   const models = (await loadModels()).installed || [];
   const meta = await api.get("/api/experiments/meta");
-  const schema = settings.schema.filter((s) => s.key !== "rerank_model");
+  const schema = settings.schema;
   const byKey = Object.fromEntries(schema.map((s) => [s.key, s]));
   const v = settings.values;
   const state = { set: setId || sets[0].id, mode: "answers", overrides: [], sweep: preset.sweep ? { key: preset.sweep, values: "" } : null,

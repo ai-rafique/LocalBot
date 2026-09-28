@@ -1,7 +1,8 @@
 # LocalBot
 
 Private question answering over your own documents. Add PDF, Word,
-PowerPoint and Excel files, Markdown, text and pictures, ask questions in
+PowerPoint and Excel files, web pages, Markdown, text, JavaScript and
+ZIP archives of them (a downloaded documentation site works), ask questions in
 a chat, and get answers grounded
 in those documents with citations you can check. Everything runs on your
 computer: the models (through Ollama), the search index and all data.
@@ -137,16 +138,38 @@ low model confidence.
   score. On 100 graded answers it flagged 37% of the partial or bad ones
   while false-alarming on 11% of good ones; it adds well under a second
   per answer and can be switched off in Settings.
+- **Follow-ups work**: in a conversation, a follow-up is turned into a
+  complete search query first ("and the second one?" → a full question).
+  The chat shows what it searched for; the answer is still written to your
+  own words. Standalone questions are searched as typed: rewriting them
+  didn't help in testing.
 - The **details panel** (right) shows every retrieved passage with its
   score and whether it was sent, a timing breakdown, and the exact prompt
   the model saw.
 - The settings chip under the message box switches presets (Accurate /
   Balanced / Fast), the chat model, reranking and passages per answer.
+- **Comparisons** ("compare Bellman-Ford with Dijkstra", "A vs B"): each
+  thing is also searched on its own, so passages for every side reach the
+  model instead of only the better-matching one. The details panel shows
+  which side each passage was found for. Adds 1–2 s to comparison
+  questions only (Settings → Retrieval → Search each side of a comparison).
+- **Earlier messages on other subjects are left out** of what the model
+  sees, so an old topic doesn't leak into a new answer (Settings →
+  Answering → Only related earlier messages). Starting a new chat for a
+  new topic is still the cleanest.
+- **Search in** (under the message box, once you have two or more
+  documents) limits answers to one document or archive — e.g. only the
+  engine docs, not your own notes. The choice is remembered.
 
 ### Documents
 Your library. Drop files anywhere on the page to add them. Each document
 shows its passages, sections, pages and pictures read; **View passages**
 shows exactly what the model can read.
+
+Adding and re-indexing run in the background with a progress bar (also
+shown in the sidebar), so you can keep chatting; a large archive takes
+minutes. A document's old passages are replaced only once all its new
+ones are stored, so an interrupted re-index never leaves it half-empty.
 
 | Format | What's read |
 |---|---|
@@ -154,17 +177,48 @@ shows exactly what the model can read.
 | Word (.docx) | Text with heading styles, tables, pictures in place |
 | PowerPoint (.pptx) | One section per slide: title, text, tables, pictures, speaker notes |
 | Excel (.xlsx) | One section per sheet; each row written with its column names ("Port: COM1 · Baud: 9600") |
-| Markdown, text | Headings, paragraphs, code blocks |
-| Pictures (PNG, JPG, WEBP) | Transcribed |
+| Markdown, text, reStructuredText | Headings, paragraphs, code blocks |
+| Web pages (.html) | The page's main content: headings, text, lists, tables row by row, code blocks. Menus, sidebars, headers, footers and scripts are dropped |
+| JavaScript / TypeScript | Code in blocks; each top-level function and class becomes a section, so answers cite it by name |
+| ZIP archives | Every readable file inside, in all folders (see below) |
+| Pictures (PNG, JPG, WEBP) | Transcribed (when picture reading is on) |
 
-**Pictures** — inside documents or on their own — are transcribed by the
-**picture reader** model (Settings → Models; default `qwen3.5:2b`, which
-accepts images) when the document is added (a second or two each, remembered
+**ZIP archives** — e.g. a downloaded documentation site — stay one entry
+in your library, but each file inside is read on its own and citations
+name it: `godot-docs.zip › classes/class_node.html — Methods`. Skipped,
+and counted in the summary after adding:
+
+- site and tool folders (`_static`, `_sources`, `_images`, `node_modules`,
+  `build`, `dist`, `__MACOSX`, hidden folders …) and generated site files
+  (search indexes, `genindex.html`, `*.min.js`, source maps);
+- minified or bundled code, exact duplicate files, files with no text;
+- types LocalBot can't read (CSS, fonts, SVG …);
+- files over 25 MB, and anything beyond 20,000 files or 2 GB unpacked.
+
+Large libraries: tens of thousands of passages work, but re-indexing and
+chunking experiments re-embed everything (minutes for a documentation
+site), and the chunk preview includes an archive only after it has been
+read once in this session.
+
+**Pictures** are **off by default** (Settings → Chunking → Read pictures):
+with a 2 B picture reader, readings of real screenshots and figures were
+too often wrong to trust, so pictures are ignored unless you turn this on.
+When on, pictures — inside documents or on their own — are transcribed by
+the **picture reader** model (Settings → Models; must accept images, e.g.
+`qwen3.5:2b`) when the document is added (a second or two each, remembered
 afterwards), so their text becomes searchable. Text in screenshots reads
 well; diagrams and photos only get a short description. Passages read
 from a picture show its thumbnail in Sources so you can check them against
 the original. Logos repeated on every page are skipped. Pictures can be
 switched off in Settings → Chunking.
+
+**Checking and correcting pictures**: **Pictures (n)** on a document
+shows each picture next to the text read from it. If the reading is
+wrong, edit it and **Save correction**: your text replaces the model's
+reading and the document's passages update within seconds. **Read again**
+re-reads a picture; **Revert** drops your correction. From a chat answer,
+**Check or correct this reading** under a picture source jumps straight
+there.
 
 Limits: Excel answers lookups ("what's the baud rate on COM2?"), not
 calculations across many rows. Scanned PDFs (pages that are pictures of
@@ -313,10 +367,11 @@ it elsewhere; `LOCALBOT_PORT` changes the port.
 app.py                  entry point (python app.py)
 localbot/
   config.py             paths, settings schema (types, ranges, help, effects), presets
-  documents.py          reading PDF/Word/PowerPoint/Excel/text into paragraphs, tables and
-                        pictures; structure-aware chunking
+  documents.py          reading PDF/Word/PowerPoint/Excel/HTML/code/text into paragraphs,
+                        tables and pictures; ZIP filtering; structure-aware chunking
   vision.py             transcribing pictures with the chat model (cached)
-  index.py              library, embeddings, BM25 keyword index, temporary indexes
+  index.py              library, archives, embeddings, BM25 keyword index, temporary indexes
+  jobs.py               background queue for adding and re-indexing, with progress
   retrieval.py          hybrid search, reciprocal rank fusion, LLM reranking
   generation.py         prompt, streaming answer, confidence, faithfulness checks
   feedback.py           grading, reuse of graded answers, stats, export
@@ -341,6 +396,16 @@ thread, so a background run never changes what the chat uses.
 ## Troubleshooting
 
 - **"Ollama isn't running"** — start it (`ollama serve`, or the Ollama app).
+- **"Port … is reserved by Windows"** at startup — Hyper-V, WSL and Docker
+  reserve blocks of ports, and they move after updates or reboots.
+  LocalBot then picks the next free port and tells you which. To choose
+  one yourself: `$env:LOCALBOT_PORT = "5055"; python app.py`
+  (PowerShell). To see the reserved ranges:
+  `netsh interface ipv4 show excludedportrange protocol=tcp`. To keep a
+  port for good, in an Administrator terminal:
+  `net stop winnat`, then
+  `netsh int ipv4 add excludedportrange protocol=tcp startport=7860 numberofports=1`,
+  then `net start winnat`.
 - **Model "not installed"** — install it in Settings → Models, or `ollama pull <name>`.
 - **Slow answers, sidebar shows "x% on GPU"** — the model doesn't fully
   fit in GPU memory. Pick a smaller model, reduce the context window, or

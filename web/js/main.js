@@ -147,6 +147,11 @@ function renderFooter() {
     rows.push(h("a", { class: "status-line", href: "#/experiments" }, h("span", { class: "dot busy" }),
       h("span", {}, `Experiment ${r.done}/${r.total}: ${r.name}`)));
   }
+  if (st?.job) {
+    const j = st.job;
+    rows.push(h("a", { class: "status-line", href: "#/documents", title: j.step }, h("span", { class: "dot busy" }),
+      h("span", {}, j.total > 1 ? `${j.title} · ${Math.round((100 * j.done) / j.total)}%` : j.title)));
+  }
   const dark = document.documentElement.dataset.theme === "dark"
     || (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
   rows.push(h("div", { class: "footer-row" },

@@ -60,12 +60,54 @@ def _cache_path(image_id):
     return os.path.join(IMAGES_DIR, f"{image_id}.{model}.txt")
 
 
+def _edited_path(image_id):
+    return os.path.join(IMAGES_DIR, f"{image_id}.edited.txt")
+
+
 def cached(image_id):
+    """The user's correction if there is one, else the remembered reading."""
+    for path in (_edited_path(image_id), _cache_path(image_id)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            pass
+    return None
+
+
+def is_corrected(image_id):
+    return os.path.isfile(_edited_path(image_id))
+
+
+def model_reading(image_id):
     try:
         with open(_cache_path(image_id), encoding="utf-8") as f:
             return f.read()
     except OSError:
         return None
+
+
+def set_correction(image_id, text):
+    """A correction replaces the model's reading for this picture, for any
+    picture-reader model, until it's reverted."""
+    with open(_edited_path(image_id), "w", encoding="utf-8") as f:
+        f.write(text.strip())
+
+
+def clear_correction(image_id):
+    try:
+        os.remove(_edited_path(image_id))
+    except OSError:
+        pass
+
+
+def reread(image_id):
+    """Forget the model's reading and read the picture again."""
+    try:
+        os.remove(_cache_path(image_id))
+    except OSError:
+        pass
+    return transcribe(image_id)
 
 
 def can_read():

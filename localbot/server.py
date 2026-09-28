@@ -13,8 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import experiments, feedback, generation, index, models, storage, vision
-from .config import GROUPS, HOST, PORT, PRESETS, SCHEMA, S, SUPPORTED_TYPES, WEB_DIR
+from . import experiments, feedback, generation, index, jobs, models, storage, vision
+from .config import DATA_DIR, GROUPS, HOST, PORT, PRESETS, SCHEMA, S, SUPPORTED_TYPES, WEB_DIR
 
 app = FastAPI(title="LocalBot", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -29,7 +29,8 @@ def status():
     lib = index.library()
     running = storage.query("SELECT id, name, done, total FROM runs WHERE status = 'running' LIMIT 1")
     return {**models.status(), "documents": len(lib), "chunks": sum(d["chunks"] for d in lib),
-            "index": index.state(), "running_experiment": running[0] if running else None}
+            "index": index.state(), "running_experiment": running[0] if running else None,
+            "job": jobs.active()}
 
 
 def insights():
@@ -155,6 +156,7 @@ def conversation(cid: str):
 class ChatBody(BaseModel):
     message: str
     conversation_id: str | None = None
+    sources: list[str] | None = None  # search only these documents
 
 
 @app.post("/api/chat")
@@ -174,7 +176,7 @@ def chat(body: ChatBody):
             yield json.dumps({"type": "error", "message": "Your library is empty. Add documents first."}) + "\n"
             return
         try:
-            for ev in generation.answer(message, conversation_id=conv["id"]):
+            for ev in generation.answer(message, conversation_id=conv["id"], sources=body.sources or None):
                 if ev["type"] == "done":
                     ev = {"type": "done", "turn": _turn(storage.get_interaction(ev["interaction"]))}
                 yield json.dumps(ev, ensure_ascii=False) + "\n"
@@ -246,20 +248,55 @@ def list_documents():
     return {"documents": index.library(), "index": index.state(), "supported": SUPPORTED_TYPES}
 
 
+def _error_text(e):
+    return generation.friendly_error(e) if "ollama" in type(e).__module__ else str(e)
+
+
 @app.post("/api/documents")
 def upload(files: list[UploadFile] = File(...)):
-    reports, errors = [], []
-    with tempfile.TemporaryDirectory() as tmp:
-        for f in files:
-            name = os.path.basename(f.filename or "document")
-            path = os.path.join(tmp, name)
-            with open(path, "wb") as out:
-                shutil.copyfileobj(f.file, out)
-            try:
-                reports.append(index.ingest(path, name))
-            except Exception as e:
-                errors.append(generation.friendly_error(e) if "ollama" in type(e).__module__ else str(e))
-    return {"added": reports, "errors": errors, "index": index.state()}
+    """Saves the uploads and adds them in the background; returns the job,
+    which reports progress at /api/jobs/{id}."""
+    # Under data/, not the system temp folder: an archive can be gigabytes,
+    # and data/ is where the user chose to keep their documents anyway.
+    tmp = tempfile.mkdtemp(prefix="upload-", dir=DATA_DIR)
+    names = []
+    for f in files:
+        name = os.path.basename(f.filename or "document")
+        with open(os.path.join(tmp, name), "wb") as out:
+            shutil.copyfileobj(f.file, out, 1024 * 1024)
+        names.append(name)
+
+    def run(progress):
+        reports, errors = [], []
+        try:
+            for i, name in enumerate(names):
+                prefix = f"{name} ({i + 1}/{len(names)})" if len(names) > 1 else name
+                try:
+                    reports.append(index.ingest(os.path.join(tmp, name), name, move=True,
+                                                progress=lambda d, t, s: progress(d, t, f"{prefix}: {s}")))
+                except Exception as e:
+                    errors.append(_error_text(e))
+            progress(1, 1, "Preparing keyword search")
+            index.warm_up()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return {"added": reports, "errors": errors}
+
+    title = names[0] if len(names) == 1 else f"{len(names)} files"
+    return {"job": jobs.get(jobs.submit("add", f"Adding {title}", run))}
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    return jobs.all_jobs()
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
 
 
 @app.get("/api/images/{image_id}")
@@ -268,6 +305,52 @@ def image(image_id: str):
     if not path or not os.path.isfile(path):
         raise HTTPException(404, "Picture not found")
     return FileResponse(path, media_type="image/png", headers={"Cache-Control": "max-age=86400"})
+
+
+@app.get("/api/documents/{name}/pictures")
+def document_pictures(name: str):
+    return index.pictures_of(name)
+
+
+class PictureText(BaseModel):
+    text: str
+
+
+def _after_picture_change(image_id):
+    docs = index.documents_with_picture(image_id)
+    index.refresh(docs)
+    return {"text": vision.cached(image_id) or "", "model_text": vision.model_reading(image_id) or "",
+            "corrected": vision.is_corrected(image_id), "documents": docs}
+
+
+@app.put("/api/pictures/{image_id}")
+def correct_picture(image_id: str, body: PictureText):
+    if not vision.path_of(image_id):
+        raise HTTPException(404, "Picture not found")
+    if len(body.text.strip()) < 3:
+        _bad("The corrected text is empty; to drop a picture's text, write what it shows briefly instead")
+    vision.set_correction(image_id, body.text)
+    return _after_picture_change(image_id)
+
+
+@app.delete("/api/pictures/{image_id}/correction")
+def revert_picture(image_id: str):
+    if not vision.path_of(image_id):
+        raise HTTPException(404, "Picture not found")
+    vision.clear_correction(image_id)
+    return _after_picture_change(image_id)
+
+
+@app.post("/api/pictures/{image_id}/reread")
+def reread_picture(image_id: str):
+    path = vision.path_of(image_id)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(404, "Picture not found")
+    try:
+        vision.reread(image_id)
+    except Exception as e:
+        _bad(generation.friendly_error(e))
+    return _after_picture_change(image_id)
 
 
 @app.delete("/api/documents/{name}")
@@ -283,11 +366,12 @@ def document_chunks(name: str):
 
 @app.post("/api/documents/reindex")
 def reindex():
-    try:
-        reports, errors = index.reindex()
-    except Exception as e:
-        _bad(generation.friendly_error(e))
-    return {"reindexed": reports, "errors": errors, "index": index.state()}
+    def run(progress):
+        reports, errors = index.reindex(progress)
+        index.warm_up()
+        return {"reindexed": reports, "errors": errors}
+
+    return {"job": jobs.get(jobs.submit("reindex", "Re-indexing the library", run))}
 
 
 class PreviewBody(BaseModel):
@@ -439,13 +523,50 @@ def unhandled(request, exc):
     return JSONResponse(status_code=500, content={"detail": generation.friendly_error(exc)})
 
 
+def _why(err):
+    code = getattr(err, "winerror", None) or err.errno
+    if code in (10013, 13):  # WSAEACCES / EACCES
+        return "reserved by Windows (Hyper-V, WSL or Docker reserve port ranges)" if os.name == "nt" else "not permitted"
+    if code in (10048, 98, 48):  # address in use on Windows / Linux / macOS
+        return "already in use (is LocalBot already running?)"
+    return str(err)
+
+
+def open_listening_socket(port):
+    """Bind the port before announcing anything. If it's blocked, try the
+    next few, then any free port, and say why. Returns (socket, notes)."""
+    import socket
+    notes = []
+    for p in [port] + list(range(port + 1, port + 11)) + [0]:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((HOST, p))
+            return s, notes
+        except OSError as e:
+            s.close()
+            if p == port:
+                notes.append(f"Port {port} is {_why(e)}.")
+    raise SystemExit("No free port found on " + HOST)
+
+
 def main():
     import uvicorn
     storage.init()
     experiments.start_worker()
-    url = f"http://{HOST}:{PORT}"
+    # Uploads interrupted by a previous shutdown.
+    for d in os.listdir(DATA_DIR):
+        if d.startswith("upload-"):
+            shutil.rmtree(os.path.join(DATA_DIR, d), ignore_errors=True)
+    # host=127.0.0.1: reachable from this machine only.
+    sock, notes = open_listening_socket(PORT)
+    port = sock.getsockname()[1]
+    for n in notes:
+        print(n)
+    if port != PORT:
+        print(f"Using port {port} instead. To pick one yourself, set LOCALBOT_PORT "
+              f"(PowerShell: $env:LOCALBOT_PORT = \"{port}\"). See README → Troubleshooting.")
+    url = f"http://{HOST}:{port}"
     print(f"LocalBot running at {url}  (Ctrl+C to stop)")
     if not os.environ.get("LOCALBOT_NO_BROWSER"):
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
-    # host=127.0.0.1: reachable from this machine only.
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=[sock])

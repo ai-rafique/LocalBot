@@ -251,11 +251,12 @@ def _run_question(rid, q, cfg):
     base = {"variant": q["variant"], "answerable": q.get("answerable", True)}
     if cfg["retrieval_only"]:
         # Passages only: nothing is logged for grading, there's no answer.
-        hits, t, _ = retrieval.retrieve(q["question"])
-        sent = [h for h in hits if h["score"] >= S.cutoff()]
+        query = generation.search_query(q["question"])
+        hits, t, _, _, split_ms = generation.find_passages(q["question"], query)
+        sent = retrieval.sendable(hits)
         return None, {**base, "context_coverage": fact_coverage(" ".join(h["text"] for h in sent), q["facts"]),
                       "passages_sent": len(sent), "top_score": hits[0]["score"] if hits else None,
-                      "total_s": round(sum(t.values()) / 1000, 3)}
+                      "total_s": round((sum(t.values()) + split_ms) / 1000, 3)}
     iid = None
     for ev in generation.answer(q["question"], origin="experiment", run_id=rid, qid=q["id"],
                                 use_memory=cfg.get("use_memory", False)):
